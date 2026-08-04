@@ -18,12 +18,13 @@ GitLab Webhook
 -> Verifier
 -> Finding
 -> GitLab MR Summary Note
--> Dashboard
+-> Read API
 ```
 
 MVP 不包含：
 
 - GitHub、Gitea 和 Push Review
+- Dashboard、人工反馈和管理界面
 - 行级 Discussion 和自动 Resolve
 - 自动阻断合并
 - 完整符号索引和复杂多 Agent 编排
@@ -33,6 +34,7 @@ MVP 不包含：
 
 | 文档 | 内容 | 主要读者 |
 |---|---|---|
+| [MASTER_PLAN.md](./MASTER_PLAN.md) | 当前实现基线、目标架构、里程碑功能与验收门槛 | 负责人、架构师、研发、测试、运维 |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 系统边界、模块划分、核心流程和技术选型 | 架构师、后端、运维 |
 | [DATABASE_API.md](./DATABASE_API.md) | 数据模型、状态机、数据库约束和 API 契约 | 后端、前端、测试 |
 | [REVIEW_ENGINE.md](./REVIEW_ENGINE.md) | ContextPack、Review Schema、Verifier 和质量策略 | AI 应用、后端、测试 |
@@ -41,11 +43,13 @@ MVP 不包含：
 | [MIGRATION.md](./MIGRATION.md) | 从参考项目迁移、重写和废弃的能力边界 | 技术负责人、开发 |
 | [ROADMAP.md](./ROADMAP.md) | 分阶段实施计划、验收标准和发布策略 | 项目经理、研发团队 |
 
+建议先阅读 `MASTER_PLAN.md` 获取项目全貌和当前阶段，再按职责进入专项设计文档。
+
 ## 4. 核心决策
 
 1. 新建私有仓库 `mr-review-platform`，不直接 Fork 后持续修改开源项目。
-2. 采用模块化单体，API、Worker、Web 是三个独立部署单元，共享领域模型和适配器包。
-3. MVP 使用 PostgreSQL、Redis 和 RQ，任务可靠性由数据库幂等与队列重试共同保证。
+2. 采用模块化单体，API、Dispatcher、Worker、Reconciler 是独立部署单元，共享领域模型和适配器包；Web 在后续里程碑建设。
+3. MVP 使用 PostgreSQL、Redis 和 RQ，任务可靠性由事务 Outbox、数据库幂等、原子领取、队列重试和 Reconciler 共同保证。
 4. 默认审查策略是 `simple_context`；`agentic` 只作为后续按风险启用的增强策略。
 5. 模型必须输出结构化 Finding；Markdown 只是结构化数据的渲染结果。
 6. 第一阶段只给出非阻断建议，质量达到门槛后再评估合并门禁。

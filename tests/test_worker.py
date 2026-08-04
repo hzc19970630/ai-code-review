@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 from sqlalchemy import select
 
 from mr_review_platform.config import Settings
@@ -11,7 +14,7 @@ from mr_review_platform.services import ProjectRegistration, register_project
 from mr_review_platform.worker import process_review_job
 
 
-def test_worker_completes_structured_review(tmp_path, monkeypatch) -> None:
+def test_duplicate_worker_delivery_runs_llm_and_gitlab_note_once(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
     monkeypatch.setenv("TEST_WEBHOOK_SECRET", "webhook-secret")
     monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
@@ -72,6 +75,7 @@ def test_worker_completes_structured_review(tmp_path, monkeypatch) -> None:
         job_id = job.id
 
     notes: list[str] = []
+    llm_calls: list[int] = []
 
     class FakeGitLabClient:
         def __init__(self, *_args, **_kwargs):
@@ -127,6 +131,7 @@ def test_worker_completes_structured_review(tmp_path, monkeypatch) -> None:
             return None
 
         def review(self, _context):
+            llm_calls.append(1)
             result = ReviewResult(
                 summary="A production flag is always enabled.",
                 coverage=Coverage(reviewed_files=1, skipped_files=0),
@@ -155,7 +160,20 @@ def test_worker_completes_structured_review(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("mr_review_platform.worker.GitLabClient", FakeGitLabClient)
     monkeypatch.setattr("mr_review_platform.worker.OpenAICompatibleLLM", FakeLLM)
 
-    process_review_job(job_id)
+    from mr_review_platform import worker as worker_module
+
+    original_claim_job = worker_module._claim_job
+    claim_barrier = Barrier(2)
+
+    def simultaneous_claim(target_database, target_job_id):
+        claim_barrier.wait(timeout=5)
+        return original_claim_job(target_database, target_job_id)
+
+    monkeypatch.setattr(worker_module, "_claim_job", simultaneous_claim)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(process_review_job, job_id) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=10)
 
     with database.session() as session:
         completed = session.get(ReviewJob, job_id)
@@ -168,6 +186,7 @@ def test_worker_completes_structured_review(tmp_path, monkeypatch) -> None:
         assert finding.validation_status == "valid"
         assert llm_run is not None
         assert llm_run.total_tokens == 120
+        assert len(llm_calls) == 1
         assert len(notes) == 1
         assert "Flag is always enabled" in notes[0]
         assert f"job:{job_id}" in notes[0]

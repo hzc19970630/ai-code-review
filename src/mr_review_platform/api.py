@@ -4,8 +4,9 @@ import hmac
 import json
 import logging
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
@@ -17,7 +18,7 @@ from mr_review_platform.config import Settings, get_settings
 from mr_review_platform.db import Database
 from mr_review_platform.logging import configure_logging
 from mr_review_platform.models import Finding, Project, ReviewJob, WebhookEvent
-from mr_review_platform.queueing import enqueue_review_job
+from mr_review_platform.outbox import new_review_job_outbox_event
 from mr_review_platform.schemas import FindingView, ProjectView, ReviewJobView
 from mr_review_platform.secrets import SecretResolutionError, SecretResolver
 from mr_review_platform.services import project_config_snapshot
@@ -28,14 +29,9 @@ from mr_review_platform.webhook import (
 )
 
 logger = logging.getLogger(__name__)
-EnqueueFunction = Callable[[Settings, int], None]
 
 
-def create_app(
-    settings: Settings | None = None,
-    *,
-    enqueue: EnqueueFunction = enqueue_review_job,
-) -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
     runtime_settings = settings or get_settings()
     configure_logging(runtime_settings.log_level)
     database = Database(runtime_settings.database_url)
@@ -269,6 +265,13 @@ def create_app(
                 max_attempts=runtime_settings.review_max_attempts,
             )
             db.add(review_job)
+            db.flush()
+            db.add(
+                new_review_job_outbox_event(
+                    review_job,
+                    available_at=datetime.now(UTC),
+                )
+            )
             db.commit()
             db.refresh(review_job)
         except IntegrityError:
@@ -285,18 +288,6 @@ def create_app(
                 },
             )
 
-        try:
-            enqueue(runtime_settings, review_job.id)
-            webhook_event.status = "enqueued"
-        except Exception:
-            webhook_event.status = "received"
-            webhook_event.error_message = "queue enqueue failed; reconciliation will retry"
-            logger.exception(
-                "failed to enqueue durable review job",
-                extra={"project_id": project.id, "review_job_id": review_job.id},
-            )
-        db.add(webhook_event)
-        db.commit()
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content={"status": "accepted", "review_job_id": review_job.id, "deduped": False},

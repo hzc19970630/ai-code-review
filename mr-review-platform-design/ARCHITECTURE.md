@@ -2,7 +2,7 @@
 
 ## 1. 项目定位
 
-本项目是面向企业内部 GitLab 的私有化 MR 智能审查平台，重点服务组件库、前端工程和中型后端仓库。
+本项目是面向企业内部 GitLab 的通用型私有化 MR 智能审查平台。首批只选择代表性的前端/组件库和后端项目建立质量基线，不把试点范围写成长期产品边界。
 
 平台目标不是简单调用一次模型，而是建立可追踪、可验证、可反馈的审查链路：
 
@@ -24,13 +24,15 @@
 
 ### 2.2 模块化单体
 
-MVP 不拆微服务。API、Worker、Web 分别部署，但共享同一仓库中的领域模块。
+MVP 不拆微服务。API、Dispatcher、Worker、Reconciler 分别部署，但共享同一仓库中的领域模块；Web 在 M4 建设。
 
 这样既能隔离长耗时任务，又避免过早引入服务发现、分布式事务和多仓库协作成本。
 
 ### 2.3 接口驱动
 
 核心用例只依赖 Port，不直接依赖 GitLab SDK、模型 SDK、Redis 或数据库实现。
+
+这是 M3 的目标边界。当前 Worker 仍直接组装 Database、GitLabClient 和 LLM Adapter，需通过轻量 ReviewOrchestrator 和外部 Port 落实，不拆分微服务。
 
 ```text
 ReviewMergeRequestUseCase
@@ -60,10 +62,15 @@ GitLab MR Webhook ------>| API Service       |
                          | validate/normalize|
                          +---------+---------+
                                    |
-                        transaction| ReviewJob + Event
+                        transaction| ReviewJob + Event + Outbox
                                    v
                          +-------------------+
                          | PostgreSQL        |
+                         +---------+---------+
+                                   |
+                                   v
+                         +-------------------+
+                         | Outbox Dispatcher |
                          +---------+---------+
                                    |
                                    v
@@ -97,10 +104,12 @@ Dashboard <------ Read/Management API ------> PostgreSQL
 | 单元 | 职责 | 是否可水平扩展 |
 |---|---|---|
 | `api` | Webhook、Dashboard API、认证、项目配置 | 是，无状态 |
+| `dispatcher` | 原子领取 Outbox，唯一负责 Redis 投递 | 单实例起步，可通过数据库锁扩展 |
 | `worker` | 获取代码上下文、模型调用、验证、回写 | 是，按队列并发 |
+| `reconciler` | 超时任务恢复、长时间 queued 任务补偿 | 单实例起步 |
 | `web` | 项目、ReviewJob、Finding 和指标界面 | 是，静态资源 |
 | `postgres` | 核心业务数据和任务状态 | 主从/托管高可用 |
-| `redis` | RQ 消息、短期锁和限流 | 生产需持久化或高可用 |
+| `redis` | RQ 消息和短时原子投递锁 | 生产需持久化或高可用 |
 
 Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文由 Worker 按 ID 获取，禁止在队列消息中携带 Token。
 
@@ -126,11 +135,11 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 3. 使用项目 Webhook Secret 做常量时间校验。
 4. 标准化 `mr_iid/base_sha/start_sha/head_sha/action`。
 5. 保存脱敏后的 `webhook_events`。
-6. 在同一数据库事务中按 `dedupe_key` 创建 ReviewJob。
-7. 事务提交后向 RQ 发送 `review_job_id`。
+6. 在同一数据库事务中按 `dedupe_key` 创建 ReviewJob 和唯一 OutboxEvent。
+7. Dispatcher 通过数据库锁领取 OutboxEvent，并在 Redis 短时原子锁内发送 `review_job_id`。
 8. 返回 `202`；重复任务返回已有任务和 `200`。
 
-队列发送失败时，ReviewJob 保持 `queued`。定时协调任务扫描长时间未入队的任务并重新发送，避免数据库和 Redis 双写导致任务丢失。
+队列发送失败时，OutboxEvent 回到 `pending` 并退避重试。Reconciler 只补偿超过 60 秒仍为 `queued` 的任务，避免与首次投递竞争；Redis 丢失时可由 PostgreSQL 重建投递。
 
 ### 6.2 MR 审查
 
@@ -138,7 +147,7 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 2. 加载 ProjectConfig，并保存本次 `config_snapshot`。
 3. GitLab Adapter 拉取 MR 元数据、diff 和必要文件。
 4. Context Builder 构建 ContextPack。
-5. Rule Registry 匹配通用、项目和路径级规则。
+5. Rule Compiler 匹配通用、项目和路径级规则；当前版本仅传递 `enabled_rules`，该步骤在 M3 落地。
 6. Review Engine 调用模型生成结构化结果。
 7. Verifier 校验文件、行号、证据、枚举和重复问题。
 8. 在事务中保存 Findings、LLM runs 和 ReviewJob 结果。
@@ -147,14 +156,17 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 
 ## 7. 配置优先级
 
+配置采用分层合并后再执行平台约束，不允许 MR 内容获得配置权限：
+
 ```text
-允许的 MR 临时指令
-> 仓库内 .ai-review.yml
-> 平台项目配置
-> 系统默认配置
+不可覆盖的系统安全约束
+-> 平台批准的规则与 Prompt Catalog
+-> 平台项目配置
+-> 目标分支或可信默认分支中的白名单仓库配置
+-> 平台 allowlist、数量、预算和安全策略最终钳制
 ```
 
-仓库配置属于不可信输入，只能修改白名单字段，例如规则开关、忽略路径和严重级别阈值；不能修改模型地址、凭据、网络策略和 Agent 命令白名单。
+MR 标题、描述、评论、源码以及 source/head 分支中的配置文件始终属于不可信数据，不能改变本次模型地址、凭据、Schema、发布策略和安全边界。仓库配置只能修改白名单字段，例如规则开关、忽略路径和项目约定。
 
 ## 8. 技术选型
 
@@ -199,8 +211,9 @@ mr-review-platform/
 
 ## 10. 可靠性策略
 
-- 数据库唯一索引是幂等的最终保证，Redis 锁只用于削峰。
-- Worker 通过状态条件更新抢占任务，重复执行必须得到相同业务结果。
+- 数据库唯一索引和事务 Outbox 是任务幂等与可靠投递的最终保证。
+- Dispatcher 使用数据库原子领取和 Redis 短时锁，避免检查与入队之间的并发窗口。
+- Worker 通过原子状态条件更新抢占任务，重复执行必须得到相同业务结果。
 - GitLab Note ID 持久化；任务重试优先更新已有评论。
 - 所有外部调用设置连接和读取超时，只对明确的暂时性错误重试。
 - `running` 超时任务由协调任务标记或重新入队。

@@ -1,5 +1,7 @@
 # 实施路线图
 
+> 本文保留详细阶段工作包。当前实现状态、建设优先级和里程碑验收以 `MASTER_PLAN.md` 及实际代码为准。
+
 ## 1. 使用说明
 
 本路线图以 3 至 5 人研发团队为参考，周期是估算而非承诺。每个阶段必须通过验收门槛后再扩大范围，不能以“功能开发完成”替代生产验证。
@@ -33,7 +35,7 @@
 - 明确项目代码数据策略：`internal_only/approved_external/metadata_only`。
 - 确定首个 LLM Gateway/Provider，不同时接入所有模型。
 - 收集并脱敏 Webhook、diff 和 GitLab API Fixture。
-- 建立 30 至 50 个历史 MR 的初始 Golden Dataset。
+- 先建立 10 至 20 个已裁决 MR 的种子集，M3 退出前扩展到至少 50 个并保留独立 Holdout。
 - 确定试点项目负责人、评审人和反馈流程。
 
 ### 3.2 交付物
@@ -109,7 +111,7 @@ P1 可以先用固定 ReviewResult 完成链路，不要求真实模型质量。
 
 ### 5.3 验收门槛
 
-- 结构化输出最终解析成功率不低于 99%。
+- 累计至少 100 个 Batch 响应，允许一次修复后最终解析失败数为 0；样本不足时只报告原始分子和分母。
 - 无效模型输出不会直接写入 GitLab。
 - 同一任务重试不产生重复 Note。
 - 每个任务可查询 Context 覆盖、模型版本、Token、耗时和失败原因。
@@ -228,4 +230,3 @@ code + migration + tests + observability + security + docs + rollback
 8. 实现 diff parser、Context Builder 和 Verifier。
 9. 接入一个模型和 LLMRun 记录。
 10. 完成 GitLab 汇总评论和首个端到端测试。
-

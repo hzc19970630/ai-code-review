@@ -5,8 +5,9 @@
 当前实现覆盖一期最小 MVP：
 
 - GitLab Merge Request Webhook 验签和幂等
-- PostgreSQL ReviewJob/Finding/LLMRun 持久化
-- Redis/RQ 可靠任务队列和补偿入队
+- PostgreSQL ReviewJob/Finding/LLMRun/Outbox 持久化
+- 事务 Outbox、独立 Dispatcher 和 Redis/RQ 可靠任务队列
+- Reconciler 超时恢复与 60 秒宽限补偿
 - MR diff 与文件内容拉取
 - `simple_context` 上下文构建
 - OpenAI-compatible LLM 结构化 Review
@@ -58,7 +59,9 @@ pytest
 ```bash
 alembic upgrade head
 uvicorn mr_review_platform.api:app --host 0.0.0.0 --port 8080
+python apps/worker/dispatcher.py
 rq worker mr-review --url "$REDIS_URL"
+python apps/worker/reconciler.py
 ```
 
 仅验证 API 和 OpenAPI 文档时，可以使用本地 SQLite 且关闭队列：

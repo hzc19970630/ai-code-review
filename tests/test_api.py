@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from mr_review_platform.api import create_app
 from mr_review_platform.config import Settings
+from mr_review_platform.models import OutboxEvent, ReviewJob
 from mr_review_platform.services import DEFAULT_EXTENSIONS, ProjectRegistration, register_project
+from mr_review_platform.worker import reconcile_once
 
 
 def test_webhook_is_authenticated_durable_and_idempotent(
@@ -19,9 +25,9 @@ def test_webhook_is_authenticated_durable_and_idempotent(
         queue_enabled=False,
         auto_create_schema=True,
         api_bearer_token_ref="env://TEST_API_TOKEN",
+        reconcile_grace_seconds=0,
     )
-    enqueued: list[int] = []
-    app = create_app(settings, enqueue=lambda _settings, job_id: enqueued.append(job_id))
+    app = create_app(settings)
 
     with TestClient(app) as client:
         with app.state.database.session() as session:
@@ -45,7 +51,22 @@ def test_webhook_is_authenticated_durable_and_idempotent(
             "X-Gitlab-Token": "webhook-secret",
             "X-Gitlab-Event-UUID": "event-1",
         }
-        first = client.post("/api/webhooks/gitlab", json=gitlab_payload, headers=headers)
+        start_barrier = Barrier(2)
+
+        def receive_webhook():
+            start_barrier.wait(timeout=5)
+            return client.post("/api/webhooks/gitlab", json=gitlab_payload, headers=headers)
+
+        def run_reconciler():
+            start_barrier.wait(timeout=5)
+            return reconcile_once(settings)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            webhook_future = executor.submit(receive_webhook)
+            reconcile_future = executor.submit(run_reconciler)
+            first = webhook_future.result(timeout=10)
+            assert reconcile_future.result(timeout=10) == 0
+
         duplicate_delivery = client.post(
             "/api/webhooks/gitlab", json=gitlab_payload, headers=headers
         )
@@ -61,7 +82,19 @@ def test_webhook_is_authenticated_durable_and_idempotent(
         assert duplicate_delivery.json()["deduped"] is True
         assert duplicate_head.status_code == 200
         assert duplicate_head.json()["review_job_id"] == first.json()["review_job_id"]
-        assert enqueued == [first.json()["review_job_id"]]
+
+        with app.state.database.session() as session:
+            outbox_events = session.scalars(select(OutboxEvent)).all()
+            review_job = session.get(ReviewJob, first.json()["review_job_id"])
+            assert review_job is not None
+            assert len(outbox_events) == 1
+            assert outbox_events[0].review_job_id == review_job.id
+            assert outbox_events[0].status == "pending"
+
+        # API and reconciler started concurrently, but Redis delivery has one
+        # database source of truth and cannot be created twice.
+        with app.state.database.session() as session:
+            assert len(session.scalars(select(OutboxEvent)).all()) == 1
 
         unauthorized = client.get("/api/reviews")
         authorized = client.get("/api/reviews", headers={"Authorization": "Bearer api-token"})
@@ -79,7 +112,7 @@ def test_webhook_rejects_wrong_secret(tmp_path, monkeypatch, gitlab_payload: dic
         queue_enabled=False,
         auto_create_schema=True,
     )
-    app = create_app(settings, enqueue=lambda *_: None)
+    app = create_app(settings)
 
     with TestClient(app) as client:
         with app.state.database.session() as session:

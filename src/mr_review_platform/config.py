@@ -46,6 +46,10 @@ class Settings:
     review_job_timeout_seconds: int = 300
     review_max_attempts: int = 3
     reconcile_interval_seconds: int = 30
+    reconcile_grace_seconds: int = 60
+    dispatch_interval_seconds: int = 1
+    outbox_claim_timeout_seconds: int = 300
+    enqueue_lock_seconds: int = 60
     log_level: str = "INFO"
 
     @classmethod
@@ -71,6 +75,10 @@ class Settings:
             review_job_timeout_seconds=_as_int("REVIEW_JOB_TIMEOUT_SECONDS", 300),
             review_max_attempts=_as_int("REVIEW_MAX_ATTEMPTS", 3),
             reconcile_interval_seconds=_as_int("RECONCILE_INTERVAL_SECONDS", 30),
+            reconcile_grace_seconds=_as_int("RECONCILE_GRACE_SECONDS", 60),
+            dispatch_interval_seconds=_as_int("DISPATCH_INTERVAL_SECONDS", 1),
+            outbox_claim_timeout_seconds=_as_int("OUTBOX_CLAIM_TIMEOUT_SECONDS", 300),
+            enqueue_lock_seconds=_as_int("ENQUEUE_LOCK_SECONDS", 60),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
 

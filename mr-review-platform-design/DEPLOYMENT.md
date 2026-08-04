@@ -49,12 +49,12 @@ deploy/
 ## 4. Docker Compose 试点
 
 ```text
-api + worker + web + postgres + redis
+api + dispatcher + worker + reconciler + postgres + redis
 ```
 
 要求：
 
-- API、Worker、Web 使用独立容器，不使用 Supervisor 放进同一容器。
+- API、Dispatcher、Worker、Reconciler 使用独立容器，不使用 Supervisor 放进同一容器；Web 在 M4 建设后使用独立容器。
 - PostgreSQL 和 Redis 使用持久化卷。
 - Secret 使用独立文件或 Docker Secret，不提交 `.env`。
 - 仓库缓存使用独立卷，只挂载给 Worker。
@@ -70,12 +70,13 @@ Ingress
   -> api Deployment
   -> web Deployment
 
+dispatcher Deployment -> PostgreSQL Outbox -> Redis/RQ
 worker Deployment -> Redis/RQ
 api/worker -> PostgreSQL
 worker -> GitLab + LLM Gateway
 
 migration Job
-reconcile CronJob
+reconciler Deployment
 cleanup CronJob
 ```
 
@@ -251,4 +252,3 @@ webhook_event_id -> review_job_id -> llm_run_id -> gitlab_note_id
 - 重复 Webhook 不产生重复评论
 - 服务重启后任务可以恢复
 - 试点项目有明确负责人和回滚开关
-

@@ -11,7 +11,7 @@ GitLab Webhook
 -> LLM Review
 -> Finding
 -> MR 汇总评论
--> Dashboard 查询
+-> Read API
 ```
 
 第一版优先保证：
@@ -20,7 +20,7 @@ GitLab Webhook
 - Webhook 可幂等
 - 审查记录可追踪
 - Finding 可结构化查询
-- Dashboard 可以只读展示
+- Read API 可以查询，Dashboard 在 M4 消费稳定 Read Model
 - 后期可以补配置编辑、行级评论和反馈闭环
 
 ## 2. 表清单
@@ -33,6 +33,7 @@ MVP 必做表：
 | `project_configs` | 项目审查配置 | 必做 |
 | `webhook_events` | Webhook 接收与排查记录 | 必做 |
 | `review_jobs` | 一次 MR 审查任务 | 必做 |
+| `outbox_events` | ReviewJob 可靠投递事件 | 必做 |
 | `findings` | 单条结构化审查问题 | 必做 |
 | `feedbacks` | 人工反馈记录 | 可后置 |
 | `llm_runs` | 模型、Prompt、成本、耗时和错误记录 | 必做 |
@@ -258,6 +259,36 @@ INDEX (mr_iid)
 INDEX (status, next_retry_at)
 ```
 
+### 4.4.1 outbox_events
+
+保存需要可靠投递到 Redis/RQ 的任务事件。API 在创建 ReviewJob 的同一事务中写入 Outbox；Dispatcher 是唯一 Redis 生产者。
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `BIGSERIAL` | PK | Outbox 事件 ID |
+| `review_job_id` | `BIGINT` | FK, NOT NULL | 关联审查任务 |
+| `event_type` | `VARCHAR(64)` | NOT NULL | MVP 固定为 `review_job.queued` |
+| `dedupe_key` | `VARCHAR(255)` | UNIQUE, NOT NULL | `review-job:{id}:attempt:{n}` |
+| `payload` | `JSONB` | NOT NULL | 仅包含 `review_job_id` |
+| `status` | `VARCHAR(32)` | NOT NULL | `pending`、`publishing`、`published` |
+| `available_at` | `TIMESTAMPTZ` | NOT NULL | 允许投递时间 |
+| `delivery_attempts` | `INTEGER` | NOT NULL DEFAULT 0 | Dispatcher 投递次数 |
+| `locked_at` | `TIMESTAMPTZ` | NULL | Dispatcher 原子领取时间 |
+| `published_at` | `TIMESTAMPTZ` | NULL | 最近一次成功投递时间 |
+| `last_error` | `TEXT` | NULL | 脱敏投递错误 |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL | 创建时间 |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL | 更新时间 |
+
+索引：
+
+```sql
+UNIQUE (dedupe_key)
+INDEX (status, available_at)
+INDEX (review_job_id, created_at)
+```
+
+`publishing` 超过领取超时时间会恢复为 `pending`。即使 Dispatcher 在 Redis 写入成功后、Outbox 更新前崩溃而造成重复投递，Worker 的原子状态抢占仍保证业务副作用只执行一次。
+
 ### 4.5 findings
 
 保存模型审查后的结构化问题。Dashboard、MR 评论渲染和后续反馈闭环都基于该表。
@@ -389,6 +420,7 @@ erDiagram
     projects ||--o{ webhook_events : "receives"
     projects ||--o{ review_jobs : "owns"
     webhook_events ||--o{ review_jobs : "enqueues"
+    review_jobs ||--o{ outbox_events : "dispatches"
     review_jobs ||--o{ findings : "produces"
     findings ||--o{ feedbacks : "receives"
     review_jobs ||--o{ llm_runs : "records"
@@ -430,6 +462,16 @@ erDiagram
         string gitlab_note_id
         int attempt_count
         string prompt_version
+    }
+
+    outbox_events {
+        bigint id PK
+        bigint review_job_id FK
+        string event_type
+        string dedupe_key
+        string status
+        timestamp available_at
+        int delivery_attempts
     }
 
     findings {

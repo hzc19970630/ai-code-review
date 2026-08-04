@@ -149,6 +149,7 @@ class ReviewJob(TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     findings: Mapped[list[Finding]] = relationship(back_populates="review_job")
+    outbox_events: Mapped[list[OutboxEvent]] = relationship(back_populates="review_job")
 
 
 Index(
@@ -162,6 +163,43 @@ Index(
 )
 Index("ix_review_jobs_project_created", ReviewJob.project_id, ReviewJob.created_at)
 Index("ix_review_jobs_status_retry", ReviewJob.status, ReviewJob.next_retry_at)
+
+
+class OutboxEvent(TimestampMixin, Base):
+    __tablename__ = "outbox_events"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key"),
+        CheckConstraint(
+            "status IN ('pending', 'publishing', 'published')",
+            name="ck_outbox_events_status",
+        ),
+        CheckConstraint(
+            "delivery_attempts >= 0",
+            name="ck_outbox_events_delivery_attempts",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(ID_TYPE, primary_key=True, autoincrement=True)
+    review_job_id: Mapped[int] = mapped_column(
+        ID_TYPE,
+        ForeignKey("review_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    review_job: Mapped[ReviewJob] = relationship(back_populates="outbox_events")
+
+
+Index("ix_outbox_events_pending", OutboxEvent.status, OutboxEvent.available_at)
+Index("ix_outbox_events_review_job", OutboxEvent.review_job_id, OutboxEvent.created_at)
 
 
 class Finding(TimestampMixin, Base):

@@ -74,7 +74,7 @@ new platform: all new projects and features
 2. 建立私有仓库、CI、依赖锁定和代码规范。
 3. 创建新领域对象、Port 和数据库迁移。
 4. 收集真实 GitLab Webhook/diff Fixture，完成脱敏。
-5. 建立 30 至 50 个历史 MR 的 Golden Dataset。
+5. 建立评测种子集，并在 M3 退出前扩展到至少 50 个历史 MR 和独立 Holdout。
 
 ### 5.2 GitLab Adapter
 
@@ -157,4 +157,3 @@ shadow -> internal note -> pilot -> project rollout -> old service shutdown
 - 新平台 Golden Dataset 和安全测试进入 CI
 - 监控、告警、备份恢复和运维 Runbook 完成验收
 - 许可证和第三方声明已归档
-

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import selectinload
 
 from mr_review_platform.config import Settings, get_settings
@@ -13,7 +13,7 @@ from mr_review_platform.errors import ExternalServiceError, PlatformError
 from mr_review_platform.gitlab import GitLabClient
 from mr_review_platform.llm import LLMReviewOutput, OpenAICompatibleLLM
 from mr_review_platform.models import Finding, LLMRun, Project, ReviewJob
-from mr_review_platform.queueing import enqueue_review_job
+from mr_review_platform.outbox import ensure_review_job_outbox_event
 from mr_review_platform.renderer import render_review_markdown
 from mr_review_platform.schemas import Coverage, ReviewResult
 from mr_review_platform.secrets import SecretResolver
@@ -33,27 +33,34 @@ def _ensure_utc(value: datetime) -> datetime:
 def _claim_job(database: Database, review_job_id: int) -> bool:
     now = utcnow()
     with database.session() as session:
-        job = session.scalar(
-            select(ReviewJob).where(ReviewJob.id == review_job_id).with_for_update()
+        result = session.execute(
+            update(ReviewJob)
+            .where(
+                ReviewJob.id == review_job_id,
+                ReviewJob.status == "queued",
+                ReviewJob.attempt_count < ReviewJob.max_attempts,
+                or_(ReviewJob.next_retry_at.is_(None), ReviewJob.next_retry_at <= now),
+            )
+            .values(
+                status="running",
+                attempt_count=ReviewJob.attempt_count + 1,
+                started_at=func.coalesce(ReviewJob.started_at, now),
+                heartbeat_at=now,
+                next_retry_at=None,
+            )
         )
-        if job is None or job.status != "queued":
-            return False
-        if job.next_retry_at is not None and _ensure_utc(job.next_retry_at) > now:
-            return False
-        if job.attempt_count >= job.max_attempts:
+        if result.rowcount == 1:
+            session.commit()
+            return True
+
+        job = session.get(ReviewJob, review_job_id)
+        if job is not None and job.status == "queued" and job.attempt_count >= job.max_attempts:
             job.status = "failed"
             job.error_code = "MAX_ATTEMPTS_EXCEEDED"
             job.error_message = "maximum review attempts exceeded"
             job.finished_at = now
             session.commit()
-            return False
-        job.status = "running"
-        job.attempt_count += 1
-        job.started_at = job.started_at or now
-        job.heartbeat_at = now
-        job.next_retry_at = None
-        session.commit()
-        return True
+        return False
 
 
 def _mark_stale(database: Database, review_job_id: int) -> None:
@@ -83,6 +90,11 @@ def _record_failure(database: Database, review_job_id: int, exc: Exception) -> N
             job.status = "queued"
             delay = min(30 * (2 ** max(job.attempt_count - 1, 0)), 300)
             job.next_retry_at = utcnow() + timedelta(seconds=delay)
+            ensure_review_job_outbox_event(
+                session,
+                job,
+                available_at=job.next_retry_at,
+            )
         else:
             job.status = "failed"
             job.finished_at = utcnow()
@@ -397,15 +409,17 @@ def reconcile_once(settings: Settings | None = None) -> int:
     runtime_settings = settings or get_settings()
     database = Database(runtime_settings.database_url)
     now = utcnow()
-    cutoff = now - timedelta(seconds=runtime_settings.review_job_timeout_seconds)
+    stale_cutoff = now - timedelta(seconds=runtime_settings.review_job_timeout_seconds)
+    grace_cutoff = now - timedelta(seconds=runtime_settings.reconcile_grace_seconds)
+    recovered = 0
 
     with database.session() as session:
         stale_jobs = session.scalars(
             select(ReviewJob).where(
                 ReviewJob.status == "running",
                 or_(
-                    ReviewJob.heartbeat_at < cutoff,
-                    (ReviewJob.heartbeat_at.is_(None) & (ReviewJob.started_at < cutoff)),
+                    ReviewJob.heartbeat_at < stale_cutoff,
+                    (ReviewJob.heartbeat_at.is_(None) & (ReviewJob.started_at < stale_cutoff)),
                 ),
             )
         ).all()
@@ -415,31 +429,47 @@ def reconcile_once(settings: Settings | None = None) -> int:
                 job.next_retry_at = now
                 job.error_code = "WORKER_TIMEOUT"
                 job.error_message = "worker heartbeat timed out; task will be retried"
+                _, created = ensure_review_job_outbox_event(
+                    session,
+                    job,
+                    available_at=now,
+                )
+                recovered += int(created)
             else:
                 job.status = "failed"
                 job.finished_at = now
                 job.error_code = "MAX_ATTEMPTS_EXCEEDED"
                 job.error_message = "maximum review attempts exceeded after worker timeout"
-        session.commit()
-
-        queued_ids = session.scalars(
-            select(ReviewJob.id)
+        queued_jobs = session.scalars(
+            select(ReviewJob)
             .where(
                 ReviewJob.status == "queued",
                 or_(ReviewJob.next_retry_at.is_(None), ReviewJob.next_retry_at <= now),
+                or_(
+                    ReviewJob.next_retry_at.is_not(None),
+                    ReviewJob.created_at <= grace_cutoff,
+                ),
             )
             .order_by(ReviewJob.created_at)
             .limit(100)
         ).all()
-
-    enqueued = 0
-    for review_job_id in queued_ids:
-        try:
-            enqueue_review_job(runtime_settings, review_job_id)
-            enqueued += 1
-        except Exception:
-            logger.exception(
-                "failed to reconcile review job", extra={"review_job_id": review_job_id}
+        for job in queued_jobs:
+            event, created = ensure_review_job_outbox_event(
+                session,
+                job,
+                available_at=job.next_retry_at or now,
             )
+            if created:
+                recovered += 1
+                continue
+            if event.status == "published" and _ensure_utc(event.updated_at) <= grace_cutoff:
+                event.status = "pending"
+                event.available_at = now
+                event.locked_at = None
+                event.published_at = None
+                event.last_error = "queued review job delivery reconciled"
+                recovered += 1
+        session.commit()
+
     database.engine.dispose()
-    return enqueued
+    return recovered

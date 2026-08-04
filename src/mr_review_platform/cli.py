@@ -29,6 +29,7 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list-projects")
     sub.add_parser("reconcile")
+    sub.add_parser("dispatch")
     return parser
 
 
@@ -69,7 +70,13 @@ def main() -> None:
         from mr_review_platform.worker import reconcile_once
 
         count = reconcile_once(settings)
-        print(f"enqueued {count} review jobs")
+        print(f"recovered {count} review job deliveries")
+        return
+    if args.command == "dispatch":
+        from mr_review_platform.dispatcher import dispatch_outbox_once
+
+        count = dispatch_outbox_once(settings)
+        print(f"published {count} outbox events")
 
 
 if __name__ == "__main__":
