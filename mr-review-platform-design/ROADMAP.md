@@ -157,6 +157,8 @@ Dashboard 只通过 API 访问数据，不直接连接数据库。
 - 同步 GitLab 中的人工反馈或状态变化。
 - 建立 Prompt/规则版本发布和回滚流程。
 - 增加项目并发、配额、模型和成本限制。
+- 定义 `ReviewNotificationEvent`/`NotificationPort`，复用 Outbox 接入飞书群机器人；通知只发送脱敏摘要和 GitLab 链接，失败不阻塞评审结果。
+- 验证飞书通知的 Secret 引用、事件过滤、去重、限流、重试、熔断和 Kill Switch。
 - 完成生产 Helm、备份恢复、告警和离线安装包。
 - 建立新项目标准接入流程和 Runbook。
 

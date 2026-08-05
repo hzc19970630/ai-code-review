@@ -261,15 +261,15 @@ INDEX (status, next_retry_at)
 
 ### 4.4.1 outbox_events
 
-保存需要可靠投递到 Redis/RQ 的任务事件。API 在创建 ReviewJob 的同一事务中写入 Outbox；Dispatcher 是唯一 Redis 生产者。
+保存需要可靠投递到 Redis/RQ 的任务和通知事件。API 在创建 ReviewJob 的同一事务中写入评审 Outbox；M5 结果事务可写入通知 Outbox，Dispatcher 按 `event_type` 路由，仍是唯一 Redis 生产者。
 
 | 字段 | 类型 | 约束 | 说明 |
 |---|---|---|---|
 | `id` | `BIGSERIAL` | PK | Outbox 事件 ID |
 | `review_job_id` | `BIGINT` | FK, NOT NULL | 关联审查任务 |
-| `event_type` | `VARCHAR(64)` | NOT NULL | MVP 固定为 `review_job.queued` |
+| `event_type` | `VARCHAR(64)` | NOT NULL | MVP 为 `review_job.queued`；M5 增加 `review_notification.*` |
 | `dedupe_key` | `VARCHAR(255)` | UNIQUE, NOT NULL | `review-job:{id}:attempt:{n}` |
-| `payload` | `JSONB` | NOT NULL | 仅包含 `review_job_id` |
+| `payload` | `JSONB` | NOT NULL | MVP 仅包含 `review_job_id`；M5 通知事件只允许结构化摘要引用，不保存源码、Diff 或 Secret |
 | `status` | `VARCHAR(32)` | NOT NULL | `pending`、`publishing`、`published` |
 | `available_at` | `TIMESTAMPTZ` | NOT NULL | 允许投递时间 |
 | `delivery_attempts` | `INTEGER` | NOT NULL DEFAULT 0 | Dispatcher 投递次数 |

@@ -13,6 +13,24 @@ def _escape(value: str) -> str:
     return _MARKDOWN_ESCAPE_RE.sub(r"\\\1", value.strip())
 
 
+def build_review_summary(
+    *,
+    model_summary: str,
+    findings: list[VerifiedFinding],
+    model_reviewed: bool,
+) -> str:
+    if not model_reviewed:
+        return model_summary
+
+    publishable_count = sum(
+        item.validation_status == "valid" and item.draft.severity != "info"
+        for item in findings
+    )
+    if publishable_count:
+        return f"发现 {publishable_count} 个通过验证且达到发布阈值的问题。"
+    return "未发现通过验证且达到发布阈值的问题。"
+
+
 def render_review_markdown(
     *,
     review_job_id: int,
@@ -51,9 +69,6 @@ def render_review_markdown(
                     "",
                 ]
             )
-    else:
-        lines.extend(["未发现通过验证且达到发布阈值的问题。", ""])
-
     lines.extend(
         [
             "### Coverage",

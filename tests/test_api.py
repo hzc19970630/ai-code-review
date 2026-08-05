@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from mr_review_platform.api import create_app
 from mr_review_platform.config import Settings
-from mr_review_platform.models import OutboxEvent, ReviewJob
+from mr_review_platform.models import OutboxEvent, ReviewJob, WebhookEvent
 from mr_review_platform.services import DEFAULT_EXTENSIONS, ProjectRegistration, register_project
 from mr_review_platform.worker import reconcile_once
 
@@ -141,3 +141,61 @@ def test_webhook_rejects_wrong_secret(tmp_path, monkeypatch, gitlab_payload: dic
         )
 
         assert response.status_code == 401
+
+
+def test_webhook_ignores_merged_state_even_when_action_is_open(
+    tmp_path, monkeypatch, gitlab_payload: dict
+) -> None:
+    monkeypatch.setenv("TEST_WEBHOOK_SECRET", "webhook-secret")
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    settings = Settings(
+        app_env="test",
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        queue_enabled=False,
+        auto_create_schema=True,
+    )
+    app = create_app(settings)
+    gitlab_payload["object_attributes"]["action"] = "open"
+    gitlab_payload["object_attributes"]["state"] = "merged"
+
+    with TestClient(app) as client:
+        with app.state.database.session() as session:
+            register_project(
+                session,
+                ProjectRegistration(
+                    provider_project_id="123",
+                    name="demo",
+                    namespace="team/demo",
+                    repository_url="https://gitlab.example.com/team/demo.git",
+                    web_url=None,
+                    default_branch="main",
+                    webhook_secret_ref="env://TEST_WEBHOOK_SECRET",
+                    git_token_ref="env://TEST_GITLAB_TOKEN",
+                    supported_extensions=[".py"],
+                ),
+            )
+
+        response = client.post(
+            "/api/webhooks/gitlab",
+            json=gitlab_payload,
+            headers={
+                "X-Gitlab-Event": "Merge Request Hook",
+                "X-Gitlab-Token": "webhook-secret",
+                "X-Gitlab-Event-UUID": "merged-event",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ignored",
+            "review_job_id": None,
+            "deduped": False,
+        }
+        with app.state.database.session() as session:
+            webhook = session.scalar(select(WebhookEvent))
+            assert webhook is not None
+            assert webhook.status == "ignored"
+            assert webhook.error_message == "unsupported_state:merged"
+            assert webhook.payload["object_attributes"]["state"] == "merged"
+            assert session.scalar(select(ReviewJob)) is None
+            assert session.scalar(select(OutboxEvent)) is None

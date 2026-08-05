@@ -78,3 +78,5 @@ QUEUE_ENABLED=false \
 ## MVP 边界
 
 本期不包含 React Dashboard、GitHub/Gitea、Push Review、行级 Discussion、反馈闭环、agentic 和合并门禁。
+
+飞书通知机器人属于 M5 后续通知渠道，本期不发送飞书消息；当前评审结果以 GitLab MR 汇总评论为准。

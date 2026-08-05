@@ -24,6 +24,7 @@ GitLab Webhook
 MVP 不包含：
 
 - GitHub、Gitea 和 Push Review
+- 飞书、企业微信等外部通知渠道
 - Dashboard、人工反馈和管理界面
 - 行级 Discussion 和自动 Resolve
 - 自动阻断合并

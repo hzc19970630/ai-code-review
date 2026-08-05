@@ -27,6 +27,16 @@ def test_draft_is_ignored(gitlab_payload: dict) -> None:
     assert event.ignored_reason == "draft_merge_request"
 
 
+def test_merged_state_is_ignored_even_when_action_is_open(gitlab_payload: dict) -> None:
+    gitlab_payload["object_attributes"]["action"] = "open"
+    gitlab_payload["object_attributes"]["state"] = "merged"
+
+    event = normalize_gitlab_webhook(gitlab_payload)
+
+    assert event.should_review is False
+    assert event.ignored_reason == "unsupported_state:merged"
+
+
 def test_invalid_sha_is_rejected(gitlab_payload: dict) -> None:
     gitlab_payload["object_attributes"]["last_commit"]["id"] = "not-a-sha"
 
@@ -41,3 +51,4 @@ def test_sanitized_payload_does_not_store_title_or_description(gitlab_payload: d
 
     assert "description" not in sanitized["object_attributes"]
     assert "title" not in sanitized["object_attributes"]
+    assert sanitized["object_attributes"]["state"] == "opened"

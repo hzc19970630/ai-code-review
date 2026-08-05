@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
+from threading import Event, Thread
 
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import selectinload
@@ -14,7 +15,7 @@ from mr_review_platform.gitlab import GitLabClient
 from mr_review_platform.llm import LLMReviewOutput, OpenAICompatibleLLM
 from mr_review_platform.models import Finding, LLMRun, Project, ReviewJob
 from mr_review_platform.outbox import ensure_review_job_outbox_event
-from mr_review_platform.renderer import render_review_markdown
+from mr_review_platform.renderer import build_review_summary, render_review_markdown
 from mr_review_platform.schemas import Coverage, ReviewResult
 from mr_review_platform.secrets import SecretResolver
 from mr_review_platform.verifier import VerifiedFinding, verify_review_result
@@ -63,6 +64,48 @@ def _claim_job(database: Database, review_job_id: int) -> bool:
         return False
 
 
+def _heartbeat_job(database: Database, review_job_id: int) -> bool:
+    with database.session() as session:
+        result = session.execute(
+            update(ReviewJob)
+            .where(
+                ReviewJob.id == review_job_id,
+                ReviewJob.status == "running",
+            )
+            .values(heartbeat_at=utcnow())
+        )
+        session.commit()
+        return bool(result.rowcount)
+
+
+def _start_job_heartbeat(
+    database: Database,
+    review_job_id: int,
+    *,
+    interval_seconds: float,
+) -> tuple[Event, Thread]:
+    stop_event = Event()
+
+    def heartbeat_loop() -> None:
+        while not stop_event.wait(interval_seconds):
+            try:
+                if not _heartbeat_job(database, review_job_id):
+                    return
+            except Exception:
+                logger.exception(
+                    "failed to refresh review job heartbeat",
+                    extra={"review_job_id": review_job_id},
+                )
+
+    thread = Thread(
+        target=heartbeat_loop,
+        name=f"review-heartbeat-{review_job_id}",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
+
+
 def _mark_stale(database: Database, review_job_id: int) -> None:
     with database.session() as session:
         job = session.get(ReviewJob, review_job_id)
@@ -106,7 +149,84 @@ def _record_failure(database: Database, review_job_id: int, exc: Exception) -> N
     )
 
 
-def _record_failed_llm_run(database: Database, review_job_id: int, exc: Exception) -> None:
+def _start_llm_run(
+    database: Database,
+    review_job_id: int,
+    *,
+    provider: str,
+    model: str,
+) -> int:
+    with database.session() as session:
+        job = session.get(ReviewJob, review_job_id)
+        if job is None:
+            raise RuntimeError("review job disappeared before LLM call")
+        run = LLMRun(
+            review_job_id=job.id,
+            stage="review",
+            provider=provider,
+            model=model,
+            prompt_profile=job.prompt_profile,
+            prompt_version=job.prompt_version,
+            attempt_no=job.attempt_count,
+            status="running",
+        )
+        session.add(run)
+        session.commit()
+        return run.id
+
+
+def _finish_llm_runs(
+    database: Database,
+    llm_run_id: int,
+    *,
+    llm_output: LLMReviewOutput,
+    model: str,
+) -> None:
+    with database.session() as session:
+        primary = session.get(LLMRun, llm_run_id)
+        if primary is None:
+            raise RuntimeError("LLM run disappeared")
+
+        calls = list(llm_output.calls)
+        first_call = calls[0] if calls else None
+        primary.request_hash = llm_output.request_hash
+        primary.status = "succeeded"
+        primary.error_code = None
+        primary.error_message = None
+        if first_call is not None:
+            primary.prompt_tokens = first_call.prompt_tokens
+            primary.completion_tokens = first_call.completion_tokens
+            primary.total_tokens = first_call.total_tokens
+            primary.duration_ms = first_call.duration_ms
+
+        for call in calls[1:]:
+            session.add(
+                LLMRun(
+                    review_job_id=primary.review_job_id,
+                    stage="repair",
+                    provider=primary.provider,
+                    model=model,
+                    prompt_profile=primary.prompt_profile,
+                    prompt_version=primary.prompt_version,
+                    request_hash=llm_output.request_hash,
+                    attempt_no=call.attempt_no,
+                    prompt_tokens=call.prompt_tokens,
+                    completion_tokens=call.completion_tokens,
+                    total_tokens=call.total_tokens,
+                    duration_ms=call.duration_ms,
+                    status="succeeded",
+                )
+            )
+        session.commit()
+
+
+def _record_failed_llm_run(
+    database: Database,
+    review_job_id: int,
+    exc: Exception,
+    *,
+    llm_run_id: int | None,
+) -> None:
     error_code = str(getattr(exc, "code", "LLM_UNKNOWN_ERROR"))
     if not error_code.startswith("LLM_"):
         return
@@ -115,6 +235,13 @@ def _record_failed_llm_run(database: Database, review_job_id: int, exc: Exceptio
         if job is None:
             return
         model = str(job.config_snapshot.get("llm_model") or get_settings().llm_model)
+        existing = session.get(LLMRun, llm_run_id) if llm_run_id is not None else None
+        if existing is not None:
+            existing.status = "failed"
+            existing.error_code = error_code
+            existing.error_message = str(exc)[:1000]
+            session.commit()
+            return
         session.add(
             LLMRun(
                 review_job_id=job.id,
@@ -137,11 +264,9 @@ def _save_review_result(
     *,
     review_job_id: int,
     context: ContextPack,
-    result: ReviewResult,
+    summary: str,
     verified: list[VerifiedFinding],
     markdown: str,
-    llm_output: LLMReviewOutput | None,
-    model: str,
 ) -> None:
     with database.session() as session:
         job = session.get(ReviewJob, review_job_id)
@@ -174,31 +299,12 @@ def _save_review_result(
                     status="open",
                 )
             )
-        if llm_output is not None:
-            for call in llm_output.calls:
-                session.add(
-                    LLMRun(
-                        review_job_id=job.id,
-                        stage="review" if call.attempt_no == 1 else "repair",
-                        provider="openai-compatible",
-                        model=model,
-                        prompt_profile=job.prompt_profile,
-                        prompt_version=job.prompt_version,
-                        request_hash=llm_output.request_hash,
-                        attempt_no=call.attempt_no,
-                        prompt_tokens=call.prompt_tokens,
-                        completion_tokens=call.completion_tokens,
-                        total_tokens=call.total_tokens,
-                        duration_ms=call.duration_ms,
-                        status="succeeded",
-                    )
-                )
         job.changed_files_count = len(context.changes) + len(context.skipped_files)
         job.context_files_count = len(context.changes)
         job.skipped_files_count = len(context.skipped_files)
         job.additions = context.additions
         job.deletions = context.deletions
-        job.summary = result.summary
+        job.summary = summary
         job.mr_title = str(context.mr.get("title") or job.mr_title or "") or None
         job.source_branch = context.mr.get("source_branch") or job.source_branch
         job.target_branch = context.mr.get("target_branch") or job.target_branch
@@ -247,7 +353,19 @@ def process_review_job(review_job_id: int) -> None:
     settings = get_settings()
     database = Database(settings.database_url)
     if not _claim_job(database, review_job_id):
+        database.engine.dispose()
         return
+
+    heartbeat_interval = max(
+        0.1,
+        min(settings.review_job_timeout_seconds / 3, 30.0),
+    )
+    heartbeat_stop, heartbeat_thread = _start_job_heartbeat(
+        database,
+        review_job_id,
+        interval_seconds=heartbeat_interval,
+    )
+    llm_run_id: int | None = None
 
     try:
         job, project = _load_job_context(database, review_job_id)
@@ -357,10 +475,22 @@ def process_review_job(review_job_id: int) -> None:
                 llm_api_key = resolver.resolve(
                     config.llm_credential_ref or settings.llm_api_key_ref
                 )
+                llm_run_id = _start_llm_run(
+                    database,
+                    job.id,
+                    provider=config.llm_provider,
+                    model=config.llm_model or settings.llm_model,
+                )
                 with OpenAICompatibleLLM(
                     settings, api_key=llm_api_key, model=config.llm_model
                 ) as llm:
                     llm_output = llm.review(context.to_prompt())
+                _finish_llm_runs(
+                    database,
+                    llm_run_id,
+                    llm_output=llm_output,
+                    model=config.llm_model or settings.llm_model,
+                )
                 result = llm_output.result
 
             verified = verify_review_result(
@@ -368,10 +498,15 @@ def process_review_job(review_job_id: int) -> None:
                 context,
                 min_confidence=config.min_confidence,
             )
+            summary = build_review_summary(
+                model_summary=result.summary,
+                findings=verified,
+                model_reviewed=llm_output is not None,
+            )
             markdown = render_review_markdown(
                 review_job_id=job.id,
                 head_sha=job.head_sha,
-                summary=result.summary,
+                summary=summary,
                 findings=verified,
                 context=context,
             )
@@ -379,11 +514,9 @@ def process_review_job(review_job_id: int) -> None:
                 database,
                 review_job_id=job.id,
                 context=context,
-                result=result,
+                summary=summary,
                 verified=verified,
                 markdown=markdown,
-                llm_output=llm_output,
-                model=config.llm_model or settings.llm_model,
             )
             try:
                 note_id = gitlab.upsert_note(
@@ -399,9 +532,16 @@ def process_review_job(review_job_id: int) -> None:
                 ) from exc
             _complete_job(database, job.id, note_id)
     except Exception as exc:
-        _record_failed_llm_run(database, review_job_id, exc)
+        _record_failed_llm_run(
+            database,
+            review_job_id,
+            exc,
+            llm_run_id=llm_run_id,
+        )
         _record_failure(database, review_job_id, exc)
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=max(1.0, heartbeat_interval * 2))
         database.engine.dispose()
 
 
@@ -424,6 +564,18 @@ def reconcile_once(settings: Settings | None = None) -> int:
             )
         ).all()
         for job in stale_jobs:
+            session.execute(
+                update(LLMRun)
+                .where(
+                    LLMRun.review_job_id == job.id,
+                    LLMRun.status == "running",
+                )
+                .values(
+                    status="unknown",
+                    error_code="WORKER_TIMEOUT",
+                    error_message="worker stopped before the LLM call outcome was persisted",
+                )
+            )
             if job.attempt_count < job.max_attempts:
                 job.status = "queued"
                 job.next_retry_at = now

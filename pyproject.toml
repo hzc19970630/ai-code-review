@@ -38,6 +38,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --tb=short"
+markers = [
+  "m2_integration: reliability tests requiring the isolated PostgreSQL and Redis stack",
+]
 
 [tool.ruff]
 line-length = 100

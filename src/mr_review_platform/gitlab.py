@@ -42,14 +42,22 @@ class GitLabClient:
     def close(self) -> None:
         self._client.close()
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        retry_ambiguous: bool = True,
+        **kwargs: Any,
+    ) -> httpx.Response:
         last_error: Exception | None = None
-        for attempt in range(1, self._max_retries + 1):
+        max_attempts = self._max_retries if retry_ambiguous else 1
+        for attempt in range(1, max_attempts + 1):
             try:
                 response = self._client.request(method, path, **kwargs)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = exc
-                if attempt < self._max_retries:
+                if attempt < max_attempts:
                     time.sleep(min(2 ** (attempt - 1), 5))
                     continue
                 raise ExternalServiceError(
@@ -59,7 +67,7 @@ class GitLabClient:
                 ) from exc
 
             if response.status_code == 429 or response.status_code >= 500:
-                if attempt < self._max_retries:
+                if attempt < max_attempts:
                     retry_after = response.headers.get("Retry-After")
                     delay = (
                         int(retry_after)
@@ -143,6 +151,9 @@ class GitLabClient:
             "POST",
             f"/api/v4/projects/{self._project(project_id)}/merge_requests/{mr_iid}/notes",
             json={"body": body},
+            # A timed-out POST may already have created the note. upsert_note
+            # reconciles by marker before permitting another create attempt.
+            retry_ambiguous=False,
         )
         return str(response.json()["id"])
 
@@ -187,4 +198,23 @@ class GitLabClient:
         resolved_note_id = note_id or self.find_note_by_marker(project_id, mr_iid, marker)
         if resolved_note_id:
             return self.update_note(project_id, mr_iid, resolved_note_id, body)
-        return self.create_note(project_id, mr_iid, body)
+
+        last_error: ExternalServiceError | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                return self.create_note(project_id, mr_iid, body)
+            except ExternalServiceError as exc:
+                if not exc.retryable:
+                    raise
+                last_error = exc
+
+                # The create result is unknown after a timeout or 5xx. Query
+                # the deterministic marker before issuing another POST.
+                resolved_note_id = self.find_note_by_marker(project_id, mr_iid, marker)
+                if resolved_note_id:
+                    return resolved_note_id
+                if attempt < self._max_retries:
+                    time.sleep(min(2 ** (attempt - 1), 5))
+
+        assert last_error is not None
+        raise last_error

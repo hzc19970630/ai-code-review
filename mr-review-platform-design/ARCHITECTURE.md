@@ -123,6 +123,7 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 | `review` | Review 编排、Schema、Verifier、渲染 | HTTP 路由和 GitLab SDK |
 | `rules` | 全局、项目和路径规则匹配 | 数据持久化 |
 | `llm` | Provider 适配、超时、用量采集 | 业务严重级别决策 |
+| `notification` | 结构化 Review 通知事件、渠道路由和 Feishu 适配器 | 评审决策、源码读取和 GitLab Note 状态 |
 | `storage` | ORM、Repository、事务和迁移 | 业务编排 |
 | `dashboard` | 查询、筛选、反馈和配置 | 直接调用 GitLab 或 LLM |
 
@@ -153,6 +154,7 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 8. 在事务中保存 Findings、LLM runs 和 ReviewJob 结果。
 9. Markdown Renderer 从 Findings 生成汇总评论。
 10. Comment Writer 创建或更新 GitLab Note，并保存 Note ID。
+11. M5 以后由结果事务产生结构化通知事件，Notification Dispatcher 按渠道投递；通知失败不回滚评审结果。
 
 ## 7. 配置优先级
 

@@ -12,6 +12,7 @@ def gitlab_payload() -> dict:
         "object_attributes": {
             "iid": 7,
             "action": "update",
+            "state": "opened",
             "title": "fix: validate permission",
             "url": "https://gitlab.example.com/team/demo/-/merge_requests/7",
             "source_branch": "fix/permission",

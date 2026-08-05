@@ -17,6 +17,7 @@ class NormalizedMergeRequestEvent:
     provider_project_id: str
     mr_iid: int
     action: str
+    state: str
     head_sha: str
     title: str | None
     url: str | None
@@ -44,6 +45,7 @@ def normalize_gitlab_webhook(payload: dict[str, Any]) -> NormalizedMergeRequestE
     raw_project_id = project.get("id") or attrs.get("target_project_id")
     raw_mr_iid = attrs.get("iid")
     action = str(attrs.get("action") or "")
+    state = str(attrs.get("state") or "")
     head_sha = str(last_commit.get("id") or "")
 
     if raw_project_id is None:
@@ -58,10 +60,12 @@ def normalize_gitlab_webhook(payload: dict[str, Any]) -> NormalizedMergeRequestE
         raise WebhookPayloadError("head sha is missing or invalid")
 
     is_draft = bool(attrs.get("draft") or attrs.get("work_in_progress"))
-    should_review = action in _SUPPORTED_ACTIONS and not is_draft
+    should_review = action in _SUPPORTED_ACTIONS and state == "opened" and not is_draft
     ignored_reason = None
     if is_draft:
         ignored_reason = "draft_merge_request"
+    elif state != "opened":
+        ignored_reason = f"unsupported_state:{state or 'unknown'}"
     elif action not in _SUPPORTED_ACTIONS:
         ignored_reason = f"unsupported_action:{action or 'unknown'}"
 
@@ -69,6 +73,7 @@ def normalize_gitlab_webhook(payload: dict[str, Any]) -> NormalizedMergeRequestE
         provider_project_id=str(raw_project_id),
         mr_iid=mr_iid,
         action=action,
+        state=state,
         head_sha=head_sha.lower(),
         title=attrs.get("title"),
         url=attrs.get("url"),
@@ -96,6 +101,7 @@ def sanitize_webhook_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "object_attributes": {
             "iid": attrs.get("iid"),
             "action": attrs.get("action"),
+            "state": attrs.get("state"),
             "source_branch": attrs.get("source_branch"),
             "target_branch": attrs.get("target_branch"),
             "url": attrs.get("url"),

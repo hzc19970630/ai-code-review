@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from threading import Barrier
+from time import sleep
 
 from sqlalchemy import select
 
@@ -11,7 +13,54 @@ from mr_review_platform.llm import LLMCallRecord, LLMReviewOutput
 from mr_review_platform.models import Finding, LLMRun, ReviewJob, WebhookEvent
 from mr_review_platform.schemas import Coverage, FindingDraft, ReviewResult
 from mr_review_platform.services import ProjectRegistration, register_project
-from mr_review_platform.worker import process_review_job
+from mr_review_platform.worker import _start_job_heartbeat, process_review_job
+
+
+def test_running_job_heartbeat_is_refreshed(tmp_path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'heartbeat.db'}")
+    database.create_schema()
+    old_heartbeat = datetime.now(UTC) - timedelta(minutes=5)
+    with database.session() as session:
+        job = ReviewJob(
+            project_id=1,
+            trigger_type="manual",
+            provider_project_id="123",
+            mr_iid=7,
+            head_sha="a" * 40,
+            status="running",
+            dedupe_key="heartbeat-test",
+            review_strategy="simple_context",
+            prompt_profile="default",
+            prompt_version="mvp-v1",
+            result_schema_version="1",
+            config_snapshot={},
+            attempt_count=1,
+            max_attempts=3,
+            heartbeat_at=old_heartbeat,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    stop_event, thread = _start_job_heartbeat(
+        database,
+        job_id,
+        interval_seconds=0.02,
+    )
+    try:
+        sleep(0.08)
+    finally:
+        stop_event.set()
+        thread.join(timeout=1)
+
+    with database.session() as session:
+        refreshed = session.get(ReviewJob, job_id)
+        assert refreshed is not None
+        assert refreshed.heartbeat_at is not None
+        heartbeat = refreshed.heartbeat_at
+        if heartbeat.tzinfo is None:
+            heartbeat = heartbeat.replace(tzinfo=UTC)
+        assert heartbeat > old_heartbeat
 
 
 def test_duplicate_worker_delivery_runs_llm_and_gitlab_note_once(tmp_path, monkeypatch) -> None:
@@ -182,6 +231,7 @@ def test_duplicate_worker_delivery_runs_llm_and_gitlab_note_once(tmp_path, monke
         assert completed is not None
         assert completed.status == "succeeded"
         assert completed.gitlab_note_id == "99"
+        assert completed.summary == "发现 1 个通过验证且达到发布阈值的问题。"
         assert finding is not None
         assert finding.validation_status == "valid"
         assert llm_run is not None
@@ -189,4 +239,5 @@ def test_duplicate_worker_delivery_runs_llm_and_gitlab_note_once(tmp_path, monke
         assert len(llm_calls) == 1
         assert len(notes) == 1
         assert "Flag is always enabled" in notes[0]
+        assert "A production flag is always enabled" not in notes[0]
         assert f"job:{job_id}" in notes[0]

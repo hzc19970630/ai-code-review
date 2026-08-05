@@ -2,9 +2,9 @@
 
 > 文档定位：项目设计、当前事实和建设计划的主入口。
 >
-> 状态基线：2026-08-04，以当前仓库代码、数据库迁移和自动化测试为准。
+> 状态基线：2026-08-05，以当前仓库代码、数据库迁移和自动化测试为准。
 >
-> 状态定义：`功能已实现` 表示已有代码和自动化测试支撑；`系统验收待补` 表示尚未通过真实 PostgreSQL、Redis/RQ、GitLab Staging 和故障注入验证；`规划中` 表示尚无可运行实现。
+> 状态定义：`功能已实现` 表示已有代码和自动化测试支撑；`系统验收待补` 表示尚未通过对应真实依赖或现场环境验证；`规划中` 表示尚无可运行实现。
 
 ## 1. 总体结论
 
@@ -12,7 +12,7 @@
 
 项目当前处于：
 
-**M0 至 M2 功能实现完成，生产级系统验收待补，下一步进入 M3 评审质量与项目理解建设。**
+**M0 至 M2 功能实现完成，M2 隔离依赖和故障矩阵验收已通过；下一步进入 M3 评审质量与项目理解建设，企业 GitLab Staging 仍需按 M1 清单现场验收。**
 
 现有系统已经能够：
 
@@ -96,6 +96,8 @@ flowchart LR
     Worker --> LLM["OpenAI-compatible LLM"]
     Worker --> PG
     Worker -->|"创建或更新 Note"| GitLab
+    Outcome["ReviewOutcome, M3 target"] -.-> Notification["Notification Dispatcher, M5"]
+    Notification -.-> Feishu["Feishu Bot Adapter, M5"]
     Reconciler["Reconciler"] -->|"恢复任务并补写 Outbox"| PG
     ReadAPI["Read API"] --> PG
     Dashboard["Dashboard, 规划中"] -.-> ReadAPI
@@ -115,6 +117,7 @@ flowchart LR
 | 配置快照 | ReviewJob 已保存快照，但 Worker 实际使用当前 ProjectConfig | M3.0 改为快照驱动，禁止旧任务读取可变配置 |
 | Rule/Prompt | 配置字段已预留，但无 Rule Compiler；Prompt 硬编码在 LLM Adapter | M3 建立纯函数 Catalog、Compiler 和 PromptAssembler |
 | 项目理解 | 只有 Diff 和变更文件新增行附近片段 | M3 增加受控 ProjectProfile 和 ContextManifest |
+| 通知渠道 | 当前只有 GitLab Note，没有通用通知边界 | M3 保留 `NotificationPort`，M5 以 Feishu 适配器接入，不把通知逻辑放入 Worker 核心 |
 | Dashboard | 当前无 Web，查询 API 也不是完整 Read Model | M4 先稳定 Read Model，再做最小治理界面 |
 
 ### 3.3 M3 内部目标边界
@@ -142,7 +145,7 @@ flowchart LR
 - `RuleCompiler` 是确定性纯逻辑，不访问 GitLab、数据库和 LLM。
 - `PromptAssembler` 不访问外部系统，只消费已解析的数据结构。
 - `Verifier/Aggregator` 不执行网络 I/O。
-- Port 只放在 GitLab、LLM、持久化、发布等外部边界，不为每个内部函数创建接口。
+- Port 只放在 GitLab、LLM、持久化、发布和通知等外部边界，不为每个内部函数创建接口。
 
 这是一项模块内重构，不新增微服务、消息中间件或通用工作流引擎。
 
@@ -236,18 +239,21 @@ M3 首选复用 `review_jobs.config_snapshot` 保存 EffectiveReviewPlan，不�
 
 ### 5.3 当前测试证据边界
 
-当前 24 个 Pytest 测试已通过，覆盖 Webhook、API 去重、API/Reconciler 竞态、Worker 原子领取、Outbox、Redis 锁 Fake、LLM JSON 修复、GitLab Note Mock、Context 和 Verifier 基础行为。
+基础 Pytest 测试已通过，覆盖 Webhook、API 去重、API/Reconciler 竞态、Worker 原子领取和心跳、Outbox、Redis 锁 Fake、LLM JSON 修复、GitLab Note Mock、Context 和 Verifier 基础行为。新增的 M2 集成套件使用独立 PostgreSQL 16 和 Redis 7，覆盖 20 并发 Webhook、双 Dispatcher、双 Worker、Redis 丢失/锁过期、Dispatcher 崩溃、Worker 四阶段崩溃和 Note POST 响应超时。
 
-这些测试全部使用 SQLite、Mock 或 Fake，尚未覆盖：
+基础测试仍使用 SQLite、Mock 或 Fake；M2 集成套件已覆盖以下真实依赖和故障注入边界：
 
 - PostgreSQL `FOR UPDATE SKIP LOCKED` 并发语义。
 - 真实 Redis/RQ、锁过期、RQ Job 丢失和 Redis 清空恢复。
 - 多 Dispatcher、多 Worker 和进程崩溃点。
-- GitLab Staging 的分页、限流、POST 成功后超时等契约。
+- GitLab Note POST 成功后超时的 Mock 契约；GitLab Staging 的分页、限流、CA 和真实网络契约仍待现场验证。
+
+仍未覆盖：
+
 - 配置快照执行、发布前 Head 竞态和 Prompt Injection。
 - Golden Dataset 和按语言质量回归。
 
-因此 M0 至 M2 的准确状态是“功能实现完成，生产级系统验收待补”。
+因此 M0 至 M2 的准确状态是“功能实现完成；M2 隔离依赖验收通过，M1 的企业 GitLab Staging 现场验收和 M0 发布治理仍待补”。
 
 ## 6. 里程碑总览
 
@@ -255,7 +261,7 @@ M3 首选复用 `review_jobs.config_snapshot` 保存 EffectiveReviewPlan，不�
 |---|---|---|---|
 | M0 私有化运行基线 | 功能已实现，治理待补 | 统一运行时、存储、部署和配置 | CI、许可证、内部 CA 和发布治理在试点前补齐 |
 | M1 最小评审闭环 | 功能已实现，系统验收待补 | Webhook 到 GitLab 评论可用 | 真实 GitLab Staging 契约通过 |
-| M2 可靠投递与幂等 | 功能已实现，系统验收待补 | 至少一次投递下不丢任务、不重复业务结果 | PostgreSQL/Redis/崩溃矩阵通过 |
+| M2 可靠投递与幂等 | 功能已实现，隔离依赖验收通过 | 至少一次投递下不丢任务、不重复业务结果 | PostgreSQL/Redis/崩溃矩阵已通过；生产容量和现场网络仍需验证 |
 | M3 项目理解和质量基线 | 下一阶段 | 可复现计划、项目画像、规则 Prompt、大 MR 和评测 | 两个试点生态通过离线及 Shadow 门禁 |
 | M4 可观测试点 | 规划中 | 真实项目持续运行且可诊断、可度量 | 至少 14 天和 100 个 eligible 事件 |
 | M5 反馈与企业治理 | 规划中 | 多项目运营、权限、审计和配置治理 | 权限、反馈、备份和升级验收通过 |
@@ -298,7 +304,7 @@ M3 首选复用 `review_jobs.config_snapshot` 保存 EffectiveReviewPlan，不�
 
 ### M2 可靠投递与幂等
 
-已实现：事务 Outbox、Dispatcher、Redis 投递锁、Worker 原子领取、Reconciler 宽限期、状态恢复、Finding 唯一约束和 Note Marker Upsert。
+已实现：事务 Outbox、Dispatcher、Redis 投递锁、Worker 原子领取和持续心跳、Reconciler 宽限期、状态恢复、Finding 唯一约束、Note Marker Upsert，以及 LLM 调用前后的审计落库。
 
 交付语义必须准确表达：
 
@@ -307,8 +313,8 @@ M3 首选复用 `review_jobs.config_snapshot` 保存 EffectiveReviewPlan，不�
 | Outbox 和 RQ 消息 | 至少一次 | 崩溃恢复可能产生重复消息 |
 | 同一时刻的 ReviewJob 执行 | 单 Worker 领取 | 原子状态更新阻止并发重复执行 |
 | Finding | 最终幂等 | ReviewJob + Fingerprint 唯一约束 |
-| GitLab Note | 目标为最终幂等 | Marker 查询和 Upsert，仍需 POST 超时故障测试 |
-| LLM 调用 | 可能至少一次 | LLM 成功后进程崩溃会重复调用，不能承诺严格一次 |
+| GitLab Note | 最终幂等目标已覆盖 | 创建 POST 单次尝试；结果不确定时先按 Marker 对账，再决定是否重试 |
+| LLM 调用 | 可能至少一次 | 调用前写入 `running`，模型返回后立即记录每次调用和 Token；进程硬崩溃造成的未知结果标记为 `unknown`，重试不隐藏成本 |
 
 M2 系统验收矩阵：
 
@@ -317,9 +323,19 @@ M2 系统验收矩阵：
 3. Redis 锁过期、RQ Job 丢失、Redis 清空后从 PostgreSQL 恢复。
 4. Worker 在领取后、LLM 后、结果保存后、Note 后分别崩溃。
 5. GitLab Note POST 成功但响应超时后，不产生重复 Note。
-6. 所有重试记录真实调用次数和 Token，不能隐藏重复 LLM 成本。
+6. 每次发起 LLM 请求均创建 `LLMRun`；已获得的 Token 立即落库，无法确定结果的硬崩溃窗口标记为 `unknown`，不能隐藏重复调用成本。
 
 验收门槛：已接收事件最终进入终态；同项目、MR、Head 不产生重复当前评论；Finding 不重复；所有不可恢复失败具有稳定错误码和处理说明。
+
+M2 集成验收命令（独立 PostgreSQL/Redis，不接触开发数据）：
+
+```bash
+docker compose -f docker-compose.m2.yml up -d --wait
+M2_INTEGRATION=1 .venv/bin/pytest tests/integration/m2 -m m2_integration
+docker compose -f docker-compose.m2.yml down
+```
+
+测试夹具会连续执行两次 `alembic upgrade head`，每个用例清空业务表和 Redis 数据；未设置 `M2_INTEGRATION=1` 时该套件自动跳过。
 
 ### M3 项目理解、规则 Prompt 和质量基线
 
@@ -533,7 +549,7 @@ M4 退出门槛：
 6. 每类关键告警至少故障注入一次，并在约定检测时间内触发。
 7. 项目负责人确认评论噪声可接受后才扩大试点。
 
-### M5 反馈闭环和企业治理
+### M5 反馈闭环、企业治理和通知
 
 #### M5.1 反馈与配置治理
 
@@ -549,7 +565,30 @@ M4 退出门槛：
 
 配置界面首版只允许选择已审核的 Prompt Profile/Version 和受控规则字段，不提供任意 Raw Prompt 文本框、拖拽规则 DSL 或自动规则学习。
 
-#### M5.2 身份、安全和生产交付
+#### M5.2 企业通知：先接入飞书机器人
+
+通知是评审结果的旁路消费者，不改变 GitLab MR 评审主链路。首个渠道选择飞书群机器人，后续再按实际需求增加邮件、企业微信等适配器。
+
+所需功能：
+
+1. 定义稳定的 `ReviewNotificationEvent`，至少覆盖 `review.completed`、`review.failed`、`review.stale` 和高严重级别 Finding 告警；事件只引用 `ReviewJob`、项目、MR 链接、状态、Coverage、Finding 计数、错误码和 Trace ID。
+2. 增加 `NotificationPort` 和 `FeishuBotAdapter`。核心 ReviewOrchestrator 只产生结构化事件，不依赖飞书 SDK、HTTP 格式或卡片模板。
+3. 复用现有 `outbox_events` 和 Dispatcher，按 `event_type` 路由到通知队列；不新增消息中间件。通知发送可以复用 Worker 运行单元，但必须与 GitLab Note 发布隔离重试和超时预算。
+4. 支持项目/团队级启用开关、事件类型过滤和消息模板版本；机器人 Webhook 地址、签名 Secret 和租户信息只保存 Secret Manager 引用，不进入普通配置和日志。
+5. 默认只发送摘要、严重级别、覆盖率、耗时和 GitLab 链接，不发送源码、Diff、模型完整响应或凭据。需要查看细节时跳转 GitLab 或受权限保护的 Read API。
+6. 对通知采用至少一次投递语义，使用 `channel + target + event_type + review_job_id + outcome_version` 生成去重键；发送成功后记录投递结果和响应摘要。飞书接口没有端到端幂等保证时，不宣称 exactly-once，必须支持人工重试和重复通知排查。
+7. 统一处理 TLS、连接/读取超时、限流、429/5xx、Retry-After、有界退避和熔断；飞书不可用不能阻塞 GitLab Note 或把 ReviewJob 改为失败。
+8. 记录通知成功率、延迟、重试次数、积压、按渠道失败原因和脱敏请求 ID，并提供项目级 Kill Switch。
+
+M5 通知验收：
+
+- Review 完成、失败和 stale 事件在配置启用时可到达飞书，关闭时不产生外部请求。
+- GitLab Note 成功而飞书失败时，ReviewJob 仍保持原状态，通知可独立补偿。
+- 重复 Outbox/队列消息不会无限发送；同一事件的重复投递可通过去重键和审计记录定位。
+- 飞书 401/403/429/5xx、超时、无效响应和 Secret 轮换均有契约测试与 Runbook。
+- 消息不包含源码、完整 Prompt、模型原文和 Secret，跨项目链接和数据权限校验通过。
+
+#### M5.3 身份、安全和生产交付
 
 所需功能：
 
@@ -590,6 +629,9 @@ M4 退出门槛：
 | 发布前 Head 变化 | stale/skipped，保留诊断 | 否 |
 | Note POST 结果不确定 | 先按 Marker 查询，再决定是否重试创建 | 目标为一条当前 Note |
 | 数据库保存成功、Note 失败 | 复用已保存 Outcome，仅重试发布 | 重试成功后发布 |
+| GitLab Note 成功、通知失败 | ReviewJob 保持原评审状态，通知事件独立退避重试 | 不阻塞 GitLab 结果 |
+| 通知重复投递 | 使用渠道/目标/事件版本去重键并保留审计 | 不承诺第三方 exactly-once |
+| 通知包含源码或 Secret | 事件构造层拒绝非允许字段，日志和模板脱敏 | 不发送 |
 
 所有重试必须受最大次数、总时间和总 Token 预算约束。不得通过无限重试掩盖配置错误、认证错误或模型不兼容。
 
