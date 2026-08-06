@@ -1,0 +1,50 @@
+catalog_version: rule-catalog/v1
+rules:
+  - rule_id: correctness.general
+    version: 1
+    category: correctness
+    languages: []
+    frameworks: []
+    include_paths: ["**"]
+    exclude_paths: []
+    objective: Find concrete behavior defects introduced by the change.
+    trigger: Report only when supplied code proves an incorrect state, branch, value, or control flow.
+    evidence: Quote the exact changed or visible source that proves the defect.
+    do_not_report: Do not report style preferences, speculative edge cases, or syntax diagnostics.
+    severity_guidance: Use high only for likely production failure or data corruption; otherwise medium or low.
+  - rule_id: security.general
+    version: 1
+    category: security
+    languages: []
+    frameworks: []
+    include_paths: ["**"]
+    exclude_paths: []
+    objective: Find exploitable authorization, injection, secret exposure, or unsafe trust-boundary changes.
+    trigger: Report only with a concrete attacker-controlled input and a visible unsafe operation or missing guard.
+    evidence: Quote the exact guard removal, unsafe sink, or exposed value from supplied context.
+    do_not_report: Do not report generic hardening advice without a demonstrated attack path.
+    severity_guidance: Use critical for direct broad compromise; high for practical scoped exploitation.
+  - rule_id: reliability.general
+    version: 1
+    category: reliability
+    languages: []
+    frameworks: []
+    include_paths: ["**"]
+    exclude_paths: []
+    objective: Find concrete timeout, retry, resource lifecycle, concurrency, or failure-handling regressions.
+    trigger: Report only when the supplied execution path can hang, leak, duplicate, lose, or corrupt work.
+    evidence: Quote the exact call or branch that creates the reliability failure.
+    do_not_report: Do not request retries, logging, or timeouts when the visible code already provides them.
+    severity_guidance: Use high for data loss, duplicate writes, or sustained outage; otherwise medium or low.
+  - rule_id: api_compatibility.general
+    version: 1
+    category: api_compatibility
+    languages: []
+    frameworks: []
+    include_paths: ["**"]
+    exclude_paths: []
+    objective: Find breaking changes to visible APIs, response contracts, exports, schemas, or callers.
+    trigger: Report only when supplied producer and consumer context demonstrates an incompatible contract.
+    evidence: Quote the removed or changed contract and the incompatible visible use.
+    do_not_report: Do not assume an API is public without ProjectProfile or supplied consumer evidence.
+    severity_guidance: Use high for active public or cross-module callers; otherwise medium.

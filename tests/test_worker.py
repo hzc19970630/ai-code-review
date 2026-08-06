@@ -188,6 +188,8 @@ def test_duplicate_worker_delivery_runs_llm_and_gitlab_note_once(tmp_path, monke
                     FindingDraft(
                         severity="high",
                         category="correctness",
+                        rule_id="correctness.general",
+                        scope="diff_line",
                         file_path="src/app.py",
                         line_start=2,
                         line_end=2,
@@ -231,7 +233,10 @@ def test_duplicate_worker_delivery_runs_llm_and_gitlab_note_once(tmp_path, monke
         assert completed is not None
         assert completed.status == "succeeded"
         assert completed.gitlab_note_id == "99"
-        assert completed.summary == "发现 1 个通过验证且达到发布阈值的问题。"
+        assert completed.summary == (
+            "评审未完整完成：部分文件未完成 AI 语义评审，请查看 Coverage。\n\n"
+            "发现 1 个通过验证且达到发布阈值的问题。"
+        )
         assert finding is not None
         assert finding.validation_status == "valid"
         assert llm_run is not None

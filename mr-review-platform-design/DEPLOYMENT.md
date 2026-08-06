@@ -57,7 +57,7 @@ api + dispatcher + worker + reconciler + postgres + redis
 - API、Dispatcher、Worker、Reconciler 使用独立容器，不使用 Supervisor 放进同一容器；Web 在 M4 建设后使用独立容器。
 - PostgreSQL 和 Redis 使用持久化卷。
 - Secret 使用独立文件或 Docker Secret，不提交 `.env`。
-- 仓库缓存使用独立卷，只挂载给 Worker。
+- M3 Worker 不挂载仓库缓存卷；文件内容只通过 GitLab API 按需读取并在单个任务内短期缓存。
 - 配置健康检查和容器重启策略。
 - 仅 API/Web 端口对使用者开放，数据库和 Redis 不映射到外部网络。
 
@@ -184,7 +184,7 @@ webhook_event_id -> review_job_id -> llm_run_id -> gitlab_note_id
 - LLM 调用成功率、Token、耗时、成本和 Schema 失败率
 - Finding 数量、严重级别、人工接受和误报率
 - Context 截断、跳过文件和 agentic 降级比例
-- 队列长度、Worker 心跳和仓库缓存容量
+- 队列长度、Worker 心跳、GitLab Tree 截断率和 ProjectProfile 精确读取失败率
 
 日志使用 JSON 格式，并包含 `trace_id/project_id/review_job_id`，遵守 [SECURITY.md](./SECURITY.md) 的脱敏要求。
 
@@ -200,7 +200,7 @@ webhook_event_id -> review_job_id -> llm_run_id -> gitlab_note_id
 - LLM Gateway 不可用或 Schema 失败率异常
 - PostgreSQL 连接、磁盘或复制异常
 - Redis 内存、连接或持久化异常
-- 仓库缓存超过容量阈值
+- ProjectProfile Tree 截断或声明路径读取失败率异常升高
 
 告警阈值应在试点后按正常基线调整。
 
@@ -209,7 +209,7 @@ webhook_event_id -> review_job_id -> llm_run_id -> gitlab_note_id
 - PostgreSQL 每日全量备份并保留 WAL/PITR 能力。
 - 生产建议目标：RPO 不高于 15 分钟，RTO 不高于 2 小时，最终以企业要求为准。
 - Redis 消息可以通过数据库 `queued/running` 任务重建，不作为唯一事实来源。
-- 仓库缓存不备份，可从 GitLab 重建。
+- M3 不产生仓库缓存，无需纳入备份；未来若启用也只能作为可从 GitLab 重建的派生数据。
 - Prompt、规则、Helm Values 模板和迁移文件存储在 Git。
 - 每季度至少执行一次数据库恢复和任务重建演练。
 

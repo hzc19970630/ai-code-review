@@ -1,0 +1,776 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import posixpath
+import re
+import tomllib
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from fnmatch import fnmatch
+from pathlib import PurePosixPath
+from typing import Any, Literal
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+PROFILE_SCHEMA_VERSION = "project-profile/v1"
+PROFILE_POLICY_VERSION = "project-profile-policy/v1"
+MAX_TREE_ENTRIES = 500
+MAX_PROFILE_FILES = 24
+MAX_FILE_CHARS = 8_000
+MAX_STANDARD_CHARS = 4_000
+MAX_TOTAL_CHARS = 16_000
+
+_PROFILE_FILES = {
+    ".ai-review.yml",
+    ".eslintrc",
+    ".eslintrc.json",
+    "Cargo.toml",
+    "build.gradle",
+    "build.gradle.kts",
+    "composer.json",
+    "eslint.config.js",
+    "eslint.config.mjs",
+    "go.mod",
+    "go.work",
+    "mypy.ini",
+    "package.json",
+    "pom.xml",
+    "pyproject.toml",
+    "pytest.ini",
+    "ruff.toml",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "setup.cfg",
+    "tox.ini",
+    "tsconfig.json",
+    "vite.config.js",
+    "vite.config.ts",
+}
+_CONFIG_NAMES = _PROFILE_FILES - {
+    ".ai-review.yml",
+    "Cargo.toml",
+    "composer.json",
+    "go.mod",
+    "go.work",
+    "package.json",
+    "pom.xml",
+    "pyproject.toml",
+}
+_SOURCE_DIR_NAMES = {"app", "apps", "cmd", "internal", "lib", "packages", "pkg", "src"}
+_TEST_DIR_NAMES = {"__tests__", "spec", "specs", "test", "tests"}
+_GENERATED_DIR_NAMES = {"build", "coverage", "dist", "generated", "out", "target"}
+_STANDARD_EXTENSIONS = {".md", ".rst", ".txt"}
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _stable_values(values: Iterable[str]) -> tuple[str, ...]:
+    return tuple(sorted({value for value in values if value}))
+
+
+def _safe_repo_path(path: str) -> str | None:
+    normalized = path.strip().replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized or normalized.startswith("/") or normalized == "..":
+        return None
+    clean = posixpath.normpath(normalized)
+    if clean in {"", ".", ".."} or clean.startswith("../"):
+        return None
+    return clean
+
+
+class RepositoryCompanionRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    match: str = Field(min_length=1, max_length=255)
+    paths: list[str] = Field(min_length=1, max_length=16)
+
+
+class RepositoryProfileConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_dirs: list[str] = Field(default_factory=list, max_length=32)
+    test_dirs: list[str] = Field(default_factory=list, max_length=32)
+    generated_dirs: list[str] = Field(default_factory=list, max_length=32)
+    key_paths: list[str] = Field(default_factory=list, max_length=32)
+    standards: list[str] = Field(default_factory=list, max_length=8)
+    companion_patterns: list[RepositoryCompanionRule] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+
+class RepositoryRulePathOverride(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    match: str = Field(min_length=1, max_length=255)
+    enable: list[str] = Field(default_factory=list, max_length=32)
+    disable: list[str] = Field(default_factory=list, max_length=32)
+
+
+class RepositoryRuleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enable: list[str] = Field(default_factory=list, max_length=32)
+    disable: list[str] = Field(default_factory=list, max_length=32)
+    path_rules: list[RepositoryRulePathOverride] = Field(
+        default_factory=list,
+        max_length=32,
+    )
+
+
+class RepositoryReviewConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    profile: RepositoryProfileConfig = Field(default_factory=RepositoryProfileConfig)
+    rules: RepositoryRuleConfig = Field(default_factory=RepositoryRuleConfig)
+
+
+class _NoAliasSafeLoader(yaml.SafeLoader):
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.YAMLError("YAML aliases are not allowed")
+        return super().compose_node(parent, index)
+
+
+class ProfileSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str
+    source_ref: str
+    kind: Literal["manifest", "config", "standard"]
+    content_hash: str
+    trust_level: Literal["trusted_target"] = "trusted_target"
+    chars_used: int = Field(ge=0)
+    truncated: bool = False
+
+
+class ProfileStandard(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str
+    content: str
+    content_hash: str
+    source_ref: str
+
+
+class CompanionRule(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    match: str
+    paths: tuple[str, ...]
+
+
+class RulePathOverride(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    match: str
+    enable: tuple[str, ...] = ()
+    disable: tuple[str, ...] = ()
+
+
+class TrustedRuleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enable: tuple[str, ...] = ()
+    disable: tuple[str, ...] = ()
+    path_rules: tuple[RulePathOverride, ...] = ()
+
+
+class ProjectProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["project-profile/v1"] = PROFILE_SCHEMA_VERSION
+    policy_version: Literal["project-profile-policy/v1"] = PROFILE_POLICY_VERSION
+    source_ref: str
+    languages: tuple[str, ...] = ()
+    frameworks: tuple[str, ...] = ()
+    package_managers: tuple[str, ...] = ()
+    workspace_roots: tuple[str, ...] = ()
+    source_dirs: tuple[str, ...] = ()
+    test_dirs: tuple[str, ...] = ()
+    generated_dirs: tuple[str, ...] = ()
+    config_entries: tuple[str, ...] = ()
+    public_api_entries: tuple[str, ...] = ()
+    key_paths: tuple[str, ...] = ()
+    companion_patterns: tuple[CompanionRule, ...] = ()
+    rule_config: TrustedRuleConfig = Field(default_factory=TrustedRuleConfig)
+    standards: tuple[ProfileStandard, ...] = ()
+    sources: tuple[ProfileSource, ...] = ()
+    limitations: tuple[str, ...] = ()
+    total_chars: int = Field(ge=0)
+
+    def canonical_data(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+
+    @property
+    def content_hash(self) -> str:
+        return _sha256_text(_canonical_json(self.canonical_data()))
+
+    def to_prompt(self) -> dict[str, Any]:
+        return {**self.canonical_data(), "content_hash": self.content_hash}
+
+    @property
+    def prompt_chars(self) -> int:
+        """Characters actually sent in the project-profile prompt payload."""
+        return len(_canonical_json(self.to_prompt()))
+
+    def coverage_limitations(self) -> list[str]:
+        messages = {
+            "PROFILE_NOT_CONFIGURED": (
+                "project profile is not configured; generic review context is used"
+            ),
+            "PROFILE_INFERRED": (
+                "project profile was inferred from target-branch manifests; "
+                "no approved repository profile configuration was found"
+            ),
+            "PROFILE_CONFIG_INVALID": (
+                "project profile configuration is invalid; inferred context is used"
+            ),
+            "PROFILE_FILE_FETCH_FAILED": (
+                "some optional project profile files could not be fetched"
+            ),
+            "PROFILE_DECLARED_PATH_NOT_FOUND": (
+                "a project profile path declared by .ai-review.yml was not found "
+                "on the trusted target ref"
+            ),
+            "PROFILE_FILE_LIMIT": "project profile file limit was reached",
+            "PROFILE_TOTAL_BUDGET": "project profile character budget was reached",
+            "PROFILE_TREE_TRUNCATED": "project profile repository tree was truncated",
+            "PROFILE_TARGET_REF_UNAVAILABLE": (
+                "trusted target-branch ref is unavailable; generic project context is used"
+            ),
+            "PROFILE_START_REF_UNAVAILABLE": (
+                "target start ref is unavailable; project profile uses the merge base ref"
+            ),
+        }
+        return [messages[code] for code in self.limitations if code in messages]
+
+
+def generic_project_profile(
+    source_ref: str,
+    *,
+    limitation: str = "PROFILE_NOT_CONFIGURED",
+) -> ProjectProfile:
+    return ProjectProfile(
+        source_ref=source_ref,
+        workspace_roots=(".",),
+        limitations=(limitation,),
+        total_chars=0,
+    )
+
+
+class ProjectProfiler:
+    def __init__(
+        self,
+        *,
+        max_tree_entries: int = MAX_TREE_ENTRIES,
+        max_files: int = MAX_PROFILE_FILES,
+        max_file_chars: int = MAX_FILE_CHARS,
+        max_total_chars: int = MAX_TOTAL_CHARS,
+    ) -> None:
+        self.max_tree_entries = max_tree_entries
+        self.max_files = max_files
+        self.max_file_chars = max_file_chars
+        self.max_total_chars = max_total_chars
+
+    def build(
+        self,
+        *,
+        source_ref: str,
+        repository_paths: Iterable[str],
+        file_loader: Callable[[str], str | None],
+        tree_truncated: bool = False,
+    ) -> ProjectProfile:
+        paths = sorted(
+            {
+                safe
+                for raw_path in repository_paths
+                if (safe := _safe_repo_path(str(raw_path))) is not None
+            }
+        )
+        limitations: set[str] = set()
+        if tree_truncated:
+            limitations.add("PROFILE_TREE_TRUNCATED")
+        if len(paths) > self.max_tree_entries:
+            paths = paths[: self.max_tree_entries]
+            limitations.add("PROFILE_TREE_TRUNCATED")
+
+        candidates = [path for path in paths if PurePosixPath(path).name in _PROFILE_FILES]
+        candidates.sort(key=lambda path: (path.count("/"), path))
+
+        loaded: dict[str, str] = {}
+        attempted_paths: set[str] = set()
+        sources: list[ProfileSource] = []
+        total_chars = 0
+
+        def read_profile_file(
+            path: str,
+            kind: Literal["manifest", "config", "standard"],
+            *,
+            missing_limitation: str | None = "PROFILE_FILE_FETCH_FAILED",
+        ):
+            nonlocal total_chars
+            if path in loaded:
+                return loaded[path]
+            if path in attempted_paths:
+                return None
+            if len(attempted_paths) >= self.max_files:
+                limitations.add("PROFILE_FILE_LIMIT")
+                return None
+            if total_chars >= self.max_total_chars:
+                limitations.add("PROFILE_TOTAL_BUDGET")
+                return None
+            attempted_paths.add(path)
+            try:
+                content = file_loader(path)
+            except Exception:
+                limitations.add("PROFILE_FILE_FETCH_FAILED")
+                return None
+            if content is None:
+                if missing_limitation is not None:
+                    limitations.add(missing_limitation)
+                return None
+            allowed = min(self.max_file_chars, self.max_total_chars - total_chars)
+            visible = content[:allowed]
+            truncated = len(content) > len(visible)
+            if truncated:
+                limitations.add("PROFILE_TOTAL_BUDGET")
+            total_chars += len(visible)
+            loaded[path] = visible
+            sources.append(
+                ProfileSource(
+                    path=path,
+                    source_ref=source_ref,
+                    kind=kind,
+                    content_hash=_sha256_text(content),
+                    chars_used=len(visible),
+                    truncated=truncated,
+                )
+            )
+            return visible
+
+        configured = False
+        profile_config = RepositoryProfileConfig()
+        repository_rule_config = RepositoryRuleConfig()
+        # The repository configuration has a fixed, trusted-target path. Reading it
+        # directly avoids making its availability depend on the bounded tree window.
+        config_text = read_profile_file(
+            ".ai-review.yml",
+            "manifest",
+            missing_limitation=None,
+        )
+        if config_text is not None:
+            try:
+                raw_config = yaml.load(config_text, Loader=_NoAliasSafeLoader) or {}
+                if not isinstance(raw_config, dict):
+                    raise ValueError("repository review config must be an object")
+                parsed_config = RepositoryReviewConfig.model_validate(raw_config)
+                profile_config = parsed_config.profile
+                repository_rule_config = parsed_config.rules
+                configured = True
+            except (ValueError, TypeError, yaml.YAMLError, ValidationError):
+                limitations.add("PROFILE_CONFIG_INVALID")
+
+        standards: list[ProfileStandard] = []
+        for raw_path in profile_config.standards:
+            standard_path = _safe_repo_path(raw_path)
+            if (
+                standard_path is None
+                or PurePosixPath(standard_path).suffix.lower() not in _STANDARD_EXTENSIONS
+            ):
+                limitations.add("PROFILE_CONFIG_INVALID")
+                continue
+            content = read_profile_file(
+                standard_path,
+                "standard",
+                missing_limitation="PROFILE_DECLARED_PATH_NOT_FOUND",
+            )
+            if content is None:
+                continue
+            visible = content[:MAX_STANDARD_CHARS]
+            source = next(item for item in sources if item.path == standard_path)
+            standards.append(
+                ProfileStandard(
+                    path=standard_path,
+                    content=visible,
+                    content_hash=source.content_hash,
+                    source_ref=source_ref,
+                )
+            )
+
+        # Explicit configuration and standards consume the shared file/character
+        # budgets first. Tree-discovered manifests are optional inference inputs.
+        for path in candidates:
+            if path == ".ai-review.yml":
+                continue
+            kind: Literal["manifest", "config"] = (
+                "config" if PurePosixPath(path).name in _CONFIG_NAMES else "manifest"
+            )
+            read_profile_file(path, kind)
+
+        facts = _ProfileFacts(paths)
+        for path, content in loaded.items():
+            facts.consume(path, content)
+
+        for path in profile_config.source_dirs:
+            if safe := _safe_repo_path(path):
+                facts.source_dirs.add(safe)
+        for path in profile_config.test_dirs:
+            if safe := _safe_repo_path(path):
+                facts.test_dirs.add(safe)
+        for path in profile_config.generated_dirs:
+            if safe := _safe_repo_path(path):
+                facts.generated_dirs.add(safe)
+        key_paths = {
+            safe for path in profile_config.key_paths if (safe := _safe_repo_path(path)) is not None
+        }
+        companion_patterns: list[CompanionRule] = []
+        for rule in profile_config.companion_patterns:
+            match = _safe_glob(rule.match)
+            normalized_targets = [_safe_repo_path(raw_path) for raw_path in rule.paths]
+            targets = tuple(sorted({path for path in normalized_targets if path is not None}))
+            if match is None or None in normalized_targets or not targets:
+                limitations.add("PROFILE_CONFIG_INVALID")
+                continue
+            companion_patterns.append(CompanionRule(match=match, paths=targets))
+
+        rule_path_overrides: list[RulePathOverride] = []
+        for override in repository_rule_config.path_rules:
+            match = _safe_glob(override.match)
+            if match is None:
+                limitations.add("PROFILE_CONFIG_INVALID")
+                continue
+            rule_path_overrides.append(
+                RulePathOverride(
+                    match=match,
+                    enable=tuple(sorted(set(override.enable))),
+                    disable=tuple(sorted(set(override.disable))),
+                )
+            )
+        trusted_rule_config = TrustedRuleConfig(
+            enable=tuple(sorted(set(repository_rule_config.enable))),
+            disable=tuple(sorted(set(repository_rule_config.disable))),
+            path_rules=tuple(
+                sorted(
+                    rule_path_overrides,
+                    key=lambda item: (item.match, item.enable, item.disable),
+                )
+            ),
+        )
+
+        if not configured:
+            if facts.languages or facts.frameworks or facts.config_entries:
+                limitations.add("PROFILE_INFERRED")
+            else:
+                limitations.add("PROFILE_NOT_CONFIGURED")
+
+        return ProjectProfile(
+            source_ref=source_ref,
+            languages=_stable_values(facts.languages),
+            frameworks=_stable_values(facts.frameworks),
+            package_managers=_stable_values(facts.package_managers),
+            workspace_roots=_stable_values(facts.workspace_roots or {"."}),
+            source_dirs=_stable_values(facts.source_dirs),
+            test_dirs=_stable_values(facts.test_dirs),
+            generated_dirs=_stable_values(facts.generated_dirs),
+            config_entries=_stable_values(facts.config_entries),
+            public_api_entries=_stable_values(facts.public_api_entries),
+            key_paths=_stable_values(key_paths),
+            companion_patterns=tuple(
+                sorted(companion_patterns, key=lambda item: (item.match, item.paths))
+            ),
+            rule_config=trusted_rule_config,
+            standards=tuple(sorted(standards, key=lambda item: item.path)),
+            sources=tuple(sorted(sources, key=lambda item: (item.path, item.kind))),
+            limitations=tuple(sorted(limitations)),
+            total_chars=total_chars,
+        )
+
+
+class _ProfileFacts:
+    def __init__(self, paths: list[str]) -> None:
+        self.paths = paths
+        self.languages: set[str] = set()
+        self.frameworks: set[str] = set()
+        self.package_managers: set[str] = set()
+        self.workspace_roots: set[str] = set()
+        self.source_dirs: set[str] = set()
+        self.test_dirs: set[str] = set()
+        self.generated_dirs: set[str] = set()
+        self.config_entries: set[str] = set()
+        self.public_api_entries: set[str] = set()
+        self._infer_from_paths()
+
+    def _infer_from_paths(self) -> None:
+        suffix_languages = {
+            ".go": "Go",
+            ".java": "Java",
+            ".js": "JavaScript",
+            ".jsx": "JavaScript",
+            ".py": "Python",
+            ".rs": "Rust",
+            ".ts": "TypeScript",
+            ".tsx": "TypeScript",
+            ".vue": "Vue",
+        }
+        for path in self.paths:
+            pure_path = PurePosixPath(path)
+            if language := suffix_languages.get(pure_path.suffix.lower()):
+                self.languages.add(language)
+            parts = pure_path.parts[:-1] if pure_path.suffix else pure_path.parts
+            for index, part in enumerate(parts):
+                prefix = "/".join(parts[: index + 1])
+                if part in _SOURCE_DIR_NAMES:
+                    self.source_dirs.add(prefix)
+                if part in _TEST_DIR_NAMES:
+                    self.test_dirs.add(prefix)
+                if part in _GENERATED_DIR_NAMES:
+                    self.generated_dirs.add(prefix)
+
+            name = pure_path.name
+            if name in _CONFIG_NAMES:
+                self.config_entries.add(path)
+            if name in {"pnpm-lock.yaml", "pnpm-workspace.yaml"}:
+                self.package_managers.add("pnpm")
+            elif name == "yarn.lock":
+                self.package_managers.add("yarn")
+            elif name == "package-lock.json":
+                self.package_managers.add("npm")
+            elif name in {"poetry.lock"}:
+                self.package_managers.add("Poetry")
+            elif name in {"uv.lock"}:
+                self.package_managers.add("uv")
+
+    def consume(self, path: str, content: str) -> None:
+        name = PurePosixPath(path).name
+        root = str(PurePosixPath(path).parent)
+        root = "." if root == "." else root
+        if name == "package.json":
+            self._package_json(content, root)
+        elif name == "pyproject.toml":
+            self._pyproject(content, root)
+        elif name == "go.mod":
+            self.languages.add("Go")
+            self.package_managers.add("Go modules")
+            self.workspace_roots.add(root)
+        elif name == "go.work":
+            self.languages.add("Go")
+            self.package_managers.add("Go workspaces")
+            self.workspace_roots.update(_parse_go_work_roots(content, root))
+        elif name == "pom.xml":
+            self.languages.add("Java")
+            self.package_managers.add("Maven")
+            self.workspace_roots.add(root)
+        elif name in {"build.gradle", "build.gradle.kts"}:
+            self.languages.add("Java")
+            self.package_managers.add("Gradle")
+            self.workspace_roots.add(root)
+        elif name == "Cargo.toml":
+            self.languages.add("Rust")
+            self.package_managers.add("Cargo")
+            self.workspace_roots.add(root)
+
+    def _package_json(self, content: str, root: str) -> None:
+        self.workspace_roots.add(root)
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        dependencies: set[str] = set()
+        for key in ("dependencies", "devDependencies", "peerDependencies"):
+            value = data.get(key)
+            if isinstance(value, dict):
+                dependencies.update(str(item).lower() for item in value)
+        framework_names = {
+            "@angular/core": "Angular",
+            "@nestjs/core": "NestJS",
+            "express": "Express",
+            "next": "Next.js",
+            "react": "React",
+            "svelte": "Svelte",
+            "vue": "Vue",
+        }
+        self.frameworks.update(
+            framework
+            for dependency, framework in framework_names.items()
+            if dependency in dependencies
+        )
+        self.languages.add("TypeScript" if "typescript" in dependencies else "JavaScript")
+        package_manager = str(data.get("packageManager") or "").split("@", 1)[0]
+        if package_manager:
+            self.package_managers.add(package_manager)
+        workspaces = data.get("workspaces")
+        if isinstance(workspaces, dict):
+            workspaces = workspaces.get("packages")
+        if isinstance(workspaces, list):
+            for item in workspaces:
+                if isinstance(item, str) and (safe := _safe_repo_path(item.rstrip("/*"))):
+                    self.workspace_roots.add(_join_root(root, safe))
+        for key in ("main", "module", "types"):
+            if isinstance(data.get(key), str):
+                self.public_api_entries.add(_join_root(root, str(data[key])))
+        exports = data.get("exports")
+        for entry in _strings_in_json(exports):
+            if entry.startswith("."):
+                self.public_api_entries.add(_join_root(root, entry))
+
+    def _pyproject(self, content: str, root: str) -> None:
+        self.languages.add("Python")
+        self.workspace_roots.add(root)
+        try:
+            data = tomllib.loads(content)
+        except (tomllib.TOMLDecodeError, TypeError):
+            return
+        tool = data.get("tool") if isinstance(data.get("tool"), dict) else {}
+        if "poetry" in tool:
+            self.package_managers.add("Poetry")
+        if "uv" in tool:
+            self.package_managers.add("uv")
+        project = data.get("project") if isinstance(data.get("project"), dict) else {}
+        dependencies = project.get("dependencies") if isinstance(project, dict) else []
+        dependency_text = " ".join(str(item).lower() for item in dependencies or [])
+        for dependency, framework in {
+            "django": "Django",
+            "fastapi": "FastAPI",
+            "flask": "Flask",
+        }.items():
+            if re.search(rf"\b{dependency}\b", dependency_text):
+                self.frameworks.add(framework)
+        scripts = project.get("scripts") if isinstance(project, dict) else None
+        if isinstance(scripts, dict):
+            for target in scripts.values():
+                module = str(target).split(":", 1)[0].replace(".", "/") + ".py"
+                self.public_api_entries.add(_join_root(root, module))
+
+
+def _join_root(root: str, path: str) -> str:
+    normalized = path.removeprefix("./")
+    return normalized if root == "." else f"{root}/{normalized}"
+
+
+def _safe_glob(pattern: str) -> str | None:
+    normalized = pattern.strip().replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    if not normalized or normalized.startswith("/"):
+        return None
+    if any(part == ".." for part in normalized.split("/")):
+        return None
+    return normalized
+
+
+@dataclass(frozen=True)
+class RelatedPathSelection:
+    path: str
+    reason: str
+
+
+def select_related_paths(
+    *,
+    changed_paths: Iterable[str],
+    repository_paths: Iterable[str],
+    profile: ProjectProfile,
+    max_files: int = 8,
+) -> list[RelatedPathSelection]:
+    changed = {_safe_repo_path(path) for path in changed_paths}
+    changed.discard(None)
+    available = {
+        safe
+        for raw_path in repository_paths
+        if (safe := _safe_repo_path(str(raw_path))) is not None
+    }
+    # Exact paths approved in the trusted-target profile do not need to appear in
+    # the bounded repository-tree sample. They remain subject to the related-file
+    # count and context-character budgets when selected and fetched.
+    available.update(profile.key_paths)
+    for rule in profile.companion_patterns:
+        available.update(rule.paths)
+    ranked: dict[str, tuple[int, str]] = {}
+
+    def add(path: str, priority: int, reason: str) -> None:
+        if path in changed or path not in available:
+            return
+        current = ranked.get(path)
+        if current is None or priority < current[0]:
+            ranked[path] = (priority, reason)
+
+    for changed_path in sorted(path for path in changed if path is not None):
+        pure = PurePosixPath(changed_path)
+        stem = pure.stem
+        suffix = pure.suffix
+        for candidate in available:
+            candidate_path = PurePosixPath(candidate)
+            candidate_stem = candidate_path.stem
+            same_name_test = candidate_stem in {
+                f"{stem}.test",
+                f"{stem}.spec",
+                f"test_{stem}",
+                f"{stem}_test",
+            }
+            if same_name_test and (candidate_path.suffix == suffix or not suffix):
+                add(candidate, 10, "same_name_test")
+        for rule in profile.companion_patterns:
+            if fnmatch(changed_path, rule.match):
+                for candidate in rule.paths:
+                    add(candidate, 20, f"companion_pattern:{rule.match}")
+
+    for path in profile.public_api_entries:
+        add(path, 30, "public_api_entry")
+    for path in profile.key_paths:
+        add(path, 40, "project_key_path")
+
+    selected = sorted(ranked.items(), key=lambda item: (item[1][0], item[0]))[:max_files]
+    return [
+        RelatedPathSelection(path=path, reason=priority_reason[1])
+        for path, priority_reason in selected
+    ]
+
+
+def _strings_in_json(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        result: list[str] = []
+        for item in value.values():
+            result.extend(_strings_in_json(item))
+        return result
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            result.extend(_strings_in_json(item))
+        return result
+    return []
+
+
+def _parse_go_work_roots(content: str, root: str) -> set[str]:
+    roots: set[str] = set()
+    in_use = False
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if line == "use (":
+            in_use = True
+            continue
+        if in_use and line == ")":
+            in_use = False
+            continue
+        candidate = ""
+        if line.startswith("use "):
+            candidate = line.removeprefix("use ").strip()
+        elif in_use and line and not line.startswith("//"):
+            candidate = line
+        if candidate and (safe := _safe_repo_path(candidate)):
+            roots.add(_join_root(root, safe))
+    return roots

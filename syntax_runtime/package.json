@@ -1,0 +1,13 @@
+{
+  "name": "mr-review-syntax-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned platform-owned TypeScript parser runtime",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "typescript": "5.9.3"
+  }
+}

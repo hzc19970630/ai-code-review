@@ -124,14 +124,13 @@ MR 标题、描述、代码、注释、文件名和仓库配置均视为不可�
 
 Debug 日志也必须经过同一脱敏器，并设置短保留期和访问控制。
 
-## 9. 仓库缓存
+## 9. 仓库读取与缓存边界
 
-- 仓库缓存目录按项目隔离，使用不可预测的内部 ID。
-- 工作区只授予 Worker 用户读写权限，不与 API/Web 容器共享。
-- `.git/config` 不允许持久化 Token。
-- 读取工具拒绝 `.env*`、`.git`、SSH key、证书、私钥和可配置的敏感路径。
-- 每次任务结束清理临时凭据；仓库缓存按 TTL 和容量上限回收。
-- 高敏感项目使用任务级临时 clone，完成后销毁。
+- M3 不执行本地 `git clone`，不持久化仓库或 GitLab Token；Worker 只通过 GitLab API 读取冻结 ref 的必要路径。
+- Repository Tree 最多读取 500 个 blob 路径；可信 `.ai-review.yml` 和经严格 Schema 校验的声明路径使用有界精确读取，不能借配置扩大为全仓下载。
+- 文件内容只存在于当前 ReviewJob 的进程内缓存和受控业务结果中，任务结束后不保留文件缓存目录。
+- 读取策略拒绝 `.env*`、`.git`、SSH key、证书、私钥和平台配置的敏感路径；ProjectProfile 仅允许白名单类型和字符预算。
+- 未来只有在正式里程碑批准本地 Git/Agent 工作区后，才引入按项目隔离目录、不可预测内部 ID、项目级锁、临时凭据、TTL/LRU 和容量回收；`.git/config` 始终不允许持久化 Token。
 
 ## 10. LLM 与 Prompt Injection
 
@@ -154,13 +153,25 @@ agentic 模式必须运行在独立沙箱：
 - 禁止通用 Shell；工具采用固定命令和结构化参数
 - 禁止编译、运行测试或解释仓库代码，除非单独建立受控执行沙箱
 
+### 11.1 确定性语法 Analyzer 边界
+
+M3.2.1 的 Syntax Analyzer 不是 Agent，也不是仓库代码执行沙箱。它只允许平台内置、固定版本的 Parser 对输入文件字节做语法解析：
+
+- 只允许批准 Catalog 中的 `analyzer_id + version + config_hash`，并冻结进 EffectiveReviewPlan。
+- 优先使用安全的进程内 Parser；必须使用独立 Runner 时只允许固定可执行文件和结构化输入输出，禁止 Shell 和仓库提供的参数。
+- 不运行 `npm`、`pip`、构建、测试、项目脚本或自定义编译器插件，不安装依赖，不做需要执行代码的 import/module resolution。
+- 不读取仓库凭据、用户主目录、Git 配置和 ContextManifest 以外的文件；默认无网络、非 root，并限制 CPU、内存、进程数、文件大小和时长。
+- TypeScript 配置、Python 配置、YAML 自定义 Tag 等仓库内容均作为不可信数据；首版只能提取白名单目标版本提示，不能改变 Runner、Parser 版本或安全策略。
+- Parser 依赖进入锁文件、SBOM、许可证和漏洞扫描；生产镜像缺失冻结版本时返回 `ANALYZER_UNAVAILABLE`，不得在线下载或静默漂移。
+- 超时、崩溃或不可用只产生脱敏 reason code 和 partial Coverage，不把失败解释为“语法正确”，也不记录无关源码内容。
+
 ## 12. 数据库、Redis 与备份
 
 - 数据库磁盘和备份加密，连接强制 TLS。
 - 应用账号按 API、Worker、迁移任务分权。
 - Redis 不对集群外暴露，启用认证和最大内存策略。
 - 备份文件使用独立密钥并定期执行恢复演练。
-- 删除项目时按保留策略清理 Payload、上下文、Finding 和仓库缓存。
+- 删除项目时按保留策略清理 Payload、上下文和 Finding；未来启用仓库缓存后再纳入同一删除流程。
 
 ## 13. 供应链安全
 
@@ -194,4 +205,3 @@ agentic 模式必须运行在独立沙箱：
 - 权限越权测试通过
 - 备份恢复和 Secret 轮换演练通过
 - 外部模型使用符合企业数据合规要求
-

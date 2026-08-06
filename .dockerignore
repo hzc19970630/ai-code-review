@@ -11,4 +11,4 @@ htmlcov
 data
 tests
 mr-review-platform-design
-
+syntax_runtime/node_modules

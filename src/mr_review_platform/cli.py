@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 from sqlalchemy import select
 
@@ -26,10 +27,22 @@ def _parser() -> argparse.ArgumentParser:
     register.add_argument("--webhook-secret-ref", required=True)
     register.add_argument("--git-token-ref", required=True)
     register.add_argument("--supported-extensions", default=",".join(DEFAULT_EXTENSIONS))
+    register.add_argument("--publish-mode", choices=("publish", "shadow"), default="publish")
 
     sub.add_parser("list-projects")
     sub.add_parser("reconcile")
     sub.add_parser("dispatch")
+    evaluate = sub.add_parser("evaluate")
+    evaluate.add_argument("--dataset", required=True)
+    evaluate.add_argument("--predictions")
+    preview = sub.add_parser("rules-preview")
+    preview.add_argument("--file", action="append", required=True)
+    preview.add_argument(
+        "--enable",
+        default="correctness,security,api_compatibility,reliability",
+    )
+    preview.add_argument("--language", action="append", default=[])
+    preview.add_argument("--framework", action="append", default=[])
     return parser
 
 
@@ -57,6 +70,7 @@ def main() -> None:
                     webhook_secret_ref=args.webhook_secret_ref,
                     git_token_ref=args.git_token_ref,
                     supported_extensions=extensions,
+                    publish_mode=args.publish_mode,
                 ),
             )
         print(f"registered project {project.id}: {project.namespace or project.name}")
@@ -77,6 +91,49 @@ def main() -> None:
 
         count = dispatch_outbox_once(settings)
         print(f"published {count} outbox events")
+        return
+    if args.command == "evaluate":
+        from mr_review_platform.evaluation import (
+            dataset_summary,
+            evaluate_dataset,
+            load_predictions,
+            load_seed_dataset,
+            report_json,
+        )
+
+        dataset = load_seed_dataset(args.dataset)
+        if args.predictions:
+            print(report_json(evaluate_dataset(dataset, load_predictions(args.predictions))))
+        else:
+            print(json.dumps(dataset_summary(dataset), ensure_ascii=False, indent=2))
+        return
+    if args.command == "rules-preview":
+        from mr_review_platform.project_profile import ProjectProfile
+        from mr_review_platform.rule_catalog import RuleCompiler
+
+        profile = ProjectProfile(
+            source_ref="cli-preview",
+            languages=tuple(sorted(set(args.language))),
+            frameworks=tuple(sorted(set(args.framework))),
+            workspace_roots=(".",),
+            total_chars=0,
+        )
+        compiled = RuleCompiler().compile(
+            file_paths=args.file,
+            project_profile=profile,
+            enabled_selectors=[item.strip() for item in args.enable.split(",") if item.strip()],
+        )
+        print(
+            json.dumps(
+                {
+                    **compiled.model_dump(mode="json"),
+                    "rule_set_hash": compiled.content_hash,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -87,6 +87,15 @@ def test_webhook_is_authenticated_durable_and_idempotent(
             outbox_events = session.scalars(select(OutboxEvent)).all()
             review_job = session.get(ReviewJob, first.json()["review_job_id"])
             assert review_job is not None
+            review_job.project_profile = {
+                "schema_version": "project-profile/v1",
+                "content_hash": "profile-hash",
+            }
+            review_job.context_manifest = {
+                "schema_version": "context-manifest/v1",
+                "terminal_state": "partial",
+            }
+            session.commit()
             assert len(outbox_events) == 1
             assert outbox_events[0].review_job_id == review_job.id
             assert outbox_events[0].status == "pending"
@@ -98,9 +107,18 @@ def test_webhook_is_authenticated_durable_and_idempotent(
 
         unauthorized = client.get("/api/reviews")
         authorized = client.get("/api/reviews", headers={"Authorization": "Bearer api-token"})
+        detail = client.get(
+            f"/api/reviews/{first.json()['review_job_id']}",
+            headers={"Authorization": "Bearer api-token"},
+        )
         assert unauthorized.status_code == 401
         assert authorized.status_code == 200
         assert authorized.json()["total"] == 1
+        assert authorized.json()["items"][0]["review_outcome"] == "partial"
+        assert detail.status_code == 200
+        assert detail.json()["review_outcome"] == "partial"
+        assert detail.json()["project_profile"]["content_hash"] == "profile-hash"
+        assert detail.json()["context_manifest"]["terminal_state"] == "partial"
 
 
 def test_webhook_rejects_wrong_secret(tmp_path, monkeypatch, gitlab_payload: dict) -> None:

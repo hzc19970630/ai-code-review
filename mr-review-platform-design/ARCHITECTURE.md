@@ -32,7 +32,7 @@ MVP 不拆微服务。API、Dispatcher、Worker、Reconciler 分别部署，但�
 
 核心用例只依赖 Port，不直接依赖 GitLab SDK、模型 SDK、Redis 或数据库实现。
 
-这是 M3 的目标边界。当前 Worker 仍直接组装 Database、GitLabClient 和 LLM Adapter，需通过轻量 ReviewOrchestrator 和外部 Port 落实，不拆分微服务。
+M3.0 已抽取轻量 `ReviewOrchestrator` 和 `ReviewModelPort`，模型调用、验证与渲染可以脱离队列做组件测试。Worker 仍负责 Database、GitLabClient、任务生命周期和发布边界；后续只在真实组件测试需求出现时继续抽取外部 Port，不拆分微服务。
 
 ```text
 ReviewMergeRequestUseCase
@@ -120,6 +120,7 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 | `webhook` | 验签、事件解析、标准化、入库 | GitLab diff 拉取、模型调用 |
 | `gitlab` | GitLab API、重试、限流、Note 更新 | 业务状态和 Prompt |
 | `context` | diff 解析、文件选择、Token 预算 | 模型调用和结果存储 |
+| `analyzers` | 固定版本的只读语法解析器注册、诊断标准化和资源限制 | 执行仓库脚本、安装项目依赖、跨文件构建和发布决策 |
 | `review` | Review 编排、Schema、Verifier、渲染 | HTTP 路由和 GitLab SDK |
 | `rules` | 全局、项目和路径规则匹配 | 数据持久化 |
 | `llm` | Provider 适配、超时、用量采集 | 业务严重级别决策 |
@@ -145,16 +146,19 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 ### 6.2 MR 审查
 
 1. Worker 以条件更新将任务从 `queued` 变为 `running`。
-2. 加载 ProjectConfig，并保存本次 `config_snapshot`。
-3. GitLab Adapter 拉取 MR 元数据、diff 和必要文件。
-4. Context Builder 构建 ContextPack。
-5. Rule Compiler 匹配通用、项目和路径级规则；当前版本仅传递 `enabled_rules`，该步骤在 M3 落地。
-6. Review Engine 调用模型生成结构化结果。
-7. Verifier 校验文件、行号、证据、枚举和重复问题。
-8. 在事务中保存 Findings、LLM runs 和 ReviewJob 结果。
-9. Markdown Renderer 从 Findings 生成汇总评论。
-10. Comment Writer 创建或更新 GitLab Note，并保存 Note ID。
-11. M5 以后由结果事务产生结构化通知事件，Notification Dispatcher 按渠道投递；通知失败不回滚评审结果。
+2. 加载任务创建时冻结的 `effective_plan` 并校验 `plan_hash`；历史任务只允许从自身 `config_snapshot` 一次性补建。
+3. GitLab Adapter 拉取 MR 元数据和 diff；ProjectProfiler 在可信目标提交上精确读取 `.ai-review.yml` 和声明的规范文件，同时只用最多 500 个 Repository Tree blob 做可选画像推断。配置声明的关键/companion 路径可绕过 Tree 样本进入候选，选中后才从冻结的 MR Head 延迟读取。
+4. Context Builder 在文件数、字符和 Token 硬预算内构建 ContextPack；任务级内存缓存只去重本次 GitLab 文件请求，不持久化 Git 仓库。
+5. Rule Compiler 按固定 Catalog 匹配通用、项目和路径级规则，并把编译结果及 Hash 冻结到本次评审输入。
+6. SyntaxAnalyzerRegistry 对 ContextManifest 中的可分析文件调用固定版本 Adapter，产生可复现的语法 Finding 或稳定的跳过/失败 reason code。
+7. Batch Planner 按稳定风险与路径顺序形成有限批次；文件在批次成功前保持 `pending`，预算耗尽或失败时保留稳定原因。
+8. Review Engine 调用模型生成结构化结果；已覆盖语法的文件通过 `do_not_report` 约束避免重复判断，每次真实 HTTP 尝试独立审计。
+9. Verifier 按 EffectiveReviewPlan 中的 `verifier_version` 使用新增行映射校验文件、行号和 literal Evidence；有限 Normalizer 只处理合法定位包装，拒绝项保存稳定 `validation_code` 且不进入发布结果。
+10. Aggregator 合并 Analyzer 与 LLM Finding，按确定性来源优先级、Verifier、Fingerprint 去重和 Coverage 汇总，不重新生成问题。
+11. 所有批次结束后仅一次保存 Findings、ContextManifest 和 ReviewJob 结果。
+12. Markdown Renderer 从 Findings 生成汇总评论。
+13. `shadow` 模式直接完成任务；`publish` 模式再次读取 MR Head，未变化时 Comment Writer 才创建或更新 GitLab Note，并保存 Note ID。
+14. M5 以后由结果事务产生结构化通知事件，Notification Dispatcher 按渠道投递；通知失败不回滚评审结果。
 
 ## 7. 配置优先级
 
@@ -181,6 +185,7 @@ MR 标题、描述、评论、源码以及 source/head 分支中的配置文件�
 | 前端 | React + TypeScript + Vite | Ant Design、TanStack Query |
 | GitLab | 独立 Adapter | 统一超时、重试、限流和内部 CA |
 | 模型 | 内部 LLM Gateway | 屏蔽 Provider 差异并执行出域策略 |
+| 确定性分析 | 平台内置语言 Parser Adapter | 固定版本、只读单文件解析；首批不执行项目构建和依赖解析 |
 | 可观测性 | OpenTelemetry + Prometheus | Trace ID 贯穿事件、任务和模型调用 |
 
 ## 9. 建议代码结构
@@ -195,6 +200,7 @@ mr-review-platform/
 │   ├── core/
 │   ├── integrations/gitlab/
 │   ├── context/
+│   ├── analyzers/
 │   ├── review/
 │   ├── rules/
 │   ├── llm/

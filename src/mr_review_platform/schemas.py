@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Severity = Literal["critical", "high", "medium", "low", "info"]
+FindingScope = Literal["diff_line", "changed_file", "mr"]
 Category = Literal[
     "correctness",
     "security",
@@ -22,7 +23,8 @@ class FindingDraft(BaseModel):
 
     severity: Severity
     category: Category
-    rule_id: str | None = Field(default=None, max_length=128)
+    rule_id: str = Field(min_length=3, max_length=128)
+    scope: FindingScope
     file_path: str | None = Field(default=None, max_length=2000)
     line_start: int | None = Field(default=None, ge=1)
     line_end: int | None = Field(default=None, ge=1)
@@ -72,6 +74,7 @@ class FindingView(BaseModel):
     severity: str
     category: str
     rule_id: str | None
+    scope: str | None
     file_path: str | None
     line_start: int | None
     line_end: int | None
@@ -81,6 +84,7 @@ class FindingView(BaseModel):
     suggestion: str | None
     confidence: int
     validation_status: str
+    validation_code: str | None
     validation_message: str | None
     status: str
 
@@ -111,7 +115,9 @@ class ReviewJobView(BaseModel):
     target_branch: str | None
     head_sha: str
     status: str
+    review_outcome: Literal["full", "partial", "none"] | None = None
     review_strategy: str
+    plan_hash: str | None
     attempt_count: int
     changed_files_count: int
     context_files_count: int

@@ -19,6 +19,7 @@ from mr_review_platform.db import Database
 from mr_review_platform.logging import configure_logging
 from mr_review_platform.models import Finding, Project, ReviewJob, WebhookEvent
 from mr_review_platform.outbox import new_review_job_outbox_event
+from mr_review_platform.review_plan import build_effective_review_plan
 from mr_review_platform.schemas import FindingView, ProjectView, ReviewJobView
 from mr_review_platform.secrets import SecretResolutionError, SecretResolver
 from mr_review_platform.services import project_config_snapshot
@@ -29,6 +30,14 @@ from mr_review_platform.webhook import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _review_job_view(job: ReviewJob) -> dict[str, object]:
+    payload = ReviewJobView.model_validate(job).model_dump()
+    manifest = job.context_manifest or {}
+    outcome = manifest.get("terminal_state") if isinstance(manifest, dict) else None
+    payload["review_outcome"] = outcome if outcome in {"full", "partial", "none"} else None
+    return payload
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -243,6 +252,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.add(webhook_event)
         try:
             db.flush()
+            config_snapshot = project_config_snapshot(
+                project.config,
+                default_llm_model=runtime_settings.llm_model,
+                default_llm_credential_ref=runtime_settings.llm_api_key_ref,
+            )
+            effective_plan = build_effective_review_plan(config_snapshot)
             review_job = ReviewJob(
                 project_id=project.id,
                 webhook_event_id=webhook_event.id,
@@ -257,11 +272,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 author_username=event.author_username,
                 status="queued",
                 dedupe_key=event.dedupe_key,
-                review_strategy=project.config.review_strategy,
-                prompt_profile=project.config.prompt_profile,
-                prompt_version="mvp-v1",
-                result_schema_version="1",
-                config_snapshot=project_config_snapshot(project.config),
+                review_strategy=effective_plan.review_strategy,
+                prompt_profile=effective_plan.prompt_profile,
+                prompt_version=effective_plan.prompt_version,
+                result_schema_version=effective_plan.result_schema_version,
+                config_snapshot=config_snapshot,
+                effective_plan=effective_plan.canonical_data(),
+                plan_hash=effective_plan.plan_hash,
                 max_attempts=runtime_settings.review_max_attempts,
             )
             db.add(review_job)
@@ -332,7 +349,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .limit(page_size)
         ).all()
         return {
-            "items": [ReviewJobView.model_validate(item).model_dump() for item in jobs],
+            "items": [_review_job_view(item) for item in jobs],
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -347,7 +364,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             select(Finding).where(Finding.review_job_id == review_id).order_by(Finding.id)
         ).all()
         return {
-            **ReviewJobView.model_validate(job).model_dump(),
+            **_review_job_view(job),
+            "project_profile": job.project_profile,
+            "context_manifest": job.context_manifest,
             "findings": [FindingView.model_validate(item).model_dump() for item in findings],
         }
 

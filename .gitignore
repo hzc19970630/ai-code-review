@@ -11,4 +11,4 @@ build/
 .ruff_cache/
 .mypy_cache/
 data/
-
+syntax_runtime/node_modules/

@@ -27,7 +27,10 @@ def test_gitlab_adapter_reads_changes_file_and_updates_existing_note() -> None:
         if path.endswith("/merge_requests/7"):
             return httpx.Response(200, json={"iid": 7, "sha": "a" * 40})
         if path.endswith("/merge_requests/7/changes"):
-            return httpx.Response(200, json={"changes": [{"new_path": "app.py"}]})
+            return httpx.Response(
+                200,
+                json={"sha": "a" * 40, "changes": [{"new_path": "app.py"}]},
+            )
         if "/repository/files/" in path:
             return httpx.Response(200, text="print('ok')\n", headers={"content-type": "text/plain"})
         if path.endswith("/merge_requests/7/notes"):
@@ -42,7 +45,9 @@ def test_gitlab_adapter_reads_changes_file_and_updates_existing_note() -> None:
 
     with GitLabClient(_settings(), "token", transport=httpx.MockTransport(handler)) as client:
         assert client.get_merge_request("123", 7)["iid"] == 7
-        assert client.get_merge_request_changes("123", 7)["overflow"] is False
+        changes = client.get_merge_request_changes("123", 7)
+        assert changes["overflow"] is False
+        assert changes["head_sha"] == "a" * 40
         assert client.get_file("123", "src/app.py", "a" * 40) == "print('ok')\n"
         note_id = client.upsert_note(
             "123", 7, "updated <!-- marker -->", note_id=None, marker="<!-- marker -->"
@@ -74,6 +79,91 @@ def test_gitlab_file_returns_none_for_binary_content() -> None:
 
     with GitLabClient(_settings(), "token", transport=transport) as client:
         assert client.get_file("123", "asset.bin", "a" * 40) is None
+
+
+def test_gitlab_repository_tree_is_paginated_and_bounded() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = request.url.params["page"]
+        if page == "1":
+            return httpx.Response(
+                200,
+                json=[
+                    {"type": "tree", "path": "src"},
+                    {"type": "blob", "path": "package.json"},
+                    {"type": "blob", "path": "src/app.ts"},
+                ],
+                headers={"X-Next-Page": "2"},
+            )
+        return httpx.Response(
+            200,
+            json=[{"type": "blob", "path": "tests/app.test.ts"}],
+            headers={"X-Next-Page": ""},
+        )
+
+    with GitLabClient(_settings(), "token", transport=httpx.MockTransport(handler)) as client:
+        complete = client.list_repository_tree("123", "a" * 40)
+        bounded = client.list_repository_tree("123", "a" * 40, max_entries=2)
+
+    assert complete.paths == ("package.json", "src/app.ts", "tests/app.test.ts")
+    assert complete.truncated is False
+    assert bounded.paths == ("package.json", "src/app.ts")
+    assert bounded.truncated is True
+
+
+def test_overflowed_changes_are_recovered_from_paginated_diffs() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/changes"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "a" * 40,
+                    "overflow": True,
+                    "changes": [{"new_path": "partial.py"}],
+                },
+            )
+        if request.url.path.endswith("/diffs") and request.url.params["page"] == "1":
+            return httpx.Response(
+                200,
+                json=[{"new_path": "z.py", "diff": "+z"}],
+                headers={"X-Next-Page": "2"},
+            )
+        if request.url.path.endswith("/diffs"):
+            return httpx.Response(
+                200,
+                json=[{"new_path": "a.py", "diff": "+a"}],
+                headers={"X-Next-Page": ""},
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with GitLabClient(_settings(), "token", transport=httpx.MockTransport(handler)) as client:
+        result = client.get_merge_request_changes("123", 7)
+
+    assert [item["new_path"] for item in result["changes"]] == ["a.py", "z.py"]
+    assert result["overflow"] is False
+    assert result["overflow_reason"] is None
+
+
+def test_overflow_diff_fetch_failure_keeps_partial_changes_and_reason() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/changes"):
+            return httpx.Response(
+                200,
+                json={
+                    "sha": "a" * 40,
+                    "overflow": True,
+                    "changes": [{"new_path": "partial.py", "diff": "+partial"}],
+                },
+            )
+        if request.url.path.endswith("/diffs"):
+            return httpx.Response(404, json={"message": "not found"})
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with GitLabClient(_settings(), "token", transport=httpx.MockTransport(handler)) as client:
+        result = client.get_merge_request_changes("123", 7)
+
+    assert [item["new_path"] for item in result["changes"]] == ["partial.py"]
+    assert result["overflow"] is True
+    assert result["overflow_reason"] == "GITLAB_DIFF_FETCH_FAILED"
 
 
 def test_note_create_timeout_reconciles_created_note_without_second_post(monkeypatch) -> None:

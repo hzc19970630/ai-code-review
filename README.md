@@ -14,6 +14,14 @@
 - 确定性 Verifier
 - GitLab 汇总 Note 创建或更新
 - 项目、任务和 Finding 只读 API
+- M3.0 不可变 EffectiveReviewPlan 与完整 Prompt 请求哈希
+- Shadow 运行、发布前 MR Head 复查和可测试 ReviewOrchestrator
+- M3.0.1 Evidence v2 字面证据校验和稳定拒绝码
+- M3.1 目标分支 ProjectProfile、相关文件和 ContextManifest
+- 12 个待人工裁决的种子样本及离线评测 CLI
+- M3.2 版本化 Rule Catalog、确定性 Compiler、规则预览和 Finding Scope
+- M3.2.1 固定版本 TS/TSX、Python、JSON、YAML 确定性语法分析器和失败 Coverage
+- M3.3 大 MR 稳定分批、总预算、部分失败聚合、逐调用 LLM 审计和 ReviewOutcome
 
 ## 快速开始
 
@@ -32,7 +40,8 @@ docker compose exec api python -m mr_review_platform.cli register-project \
   --repository-url https://gitlab.example.com/team/demo.git \
   --web-url https://gitlab.example.com/team/demo \
   --webhook-secret-ref env://DEMO_WEBHOOK_SECRET \
-  --git-token-ref env://DEMO_GITLAB_TOKEN
+  --git-token-ref env://DEMO_GITLAB_TOKEN \
+  --publish-mode publish
 ```
 
 GitLab Webhook URL：
@@ -51,6 +60,7 @@ http://<host>:8080/api/webhooks/gitlab
 python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
+cd syntax_runtime && npm ci --omit=dev --ignore-scripts && cd ..
 pytest
 ```
 
@@ -63,6 +73,25 @@ python apps/worker/dispatcher.py
 rq worker mr-review --url "$REDIS_URL"
 python apps/worker/reconciler.py
 ```
+
+校验 M3 种子评测集（不会调用 LLM）：
+
+```bash
+mr-review evaluate --dataset evaluation/seed_dataset.json
+```
+
+预览指定文件的有效规则（不会调用 LLM）：
+
+```bash
+mr-review rules-preview \
+  --file src/app.py \
+  --enable correctness,security \
+  --language Python
+```
+
+仓库级 ProjectProfile 配置模板见
+[`examples/project-profile/.ai-review.yml`](./examples/project-profile/.ai-review.yml)。该文件必须以
+`.ai-review.yml` 名称放在接入项目的目标分支仓库根目录；MR source/head 对它的修改不会改变本次评审。
 
 仅验证 API 和 OpenAPI 文档时，可以使用本地 SQLite 且关闭队列：
 

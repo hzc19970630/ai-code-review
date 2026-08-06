@@ -1,0 +1,274 @@
+{
+  "schema_version": "seed-dataset/v1",
+  "name": "m3-seed-v1",
+  "cases": [
+    {
+      "case_id": "sf-ts-unsafe-non-null",
+      "project_type": "single_frontend",
+      "language": "TypeScript",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": false,
+      "title": "Optional profile is dereferenced without a guard",
+      "changed_files": [
+        {
+          "path": "src/profile.ts",
+          "diff": "@@ -2,2 +2,3 @@\n export function label(profile?: Profile) {\n-  return profile?.name ?? 'Guest';\n+  return profile!.name;\n }"
+        }
+      ],
+      "expected_findings": [
+        {
+          "rule_id": "correctness.unchecked-optional",
+          "file_path": "src/profile.ts",
+          "line_start": 3,
+          "line_end": 3,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "sf-ts-clean-guard",
+      "project_type": "single_frontend",
+      "language": "TypeScript",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": true,
+      "title": "Optional profile keeps a fallback",
+      "changed_files": [
+        {
+          "path": "src/profile.ts",
+          "diff": "@@ -2,2 +2,3 @@\n export function label(profile?: Profile) {\n-  return profile?.name || 'Guest';\n+  return profile?.name ?? 'Guest';\n }"
+        }
+      ],
+      "expected_findings": []
+    },
+    {
+      "case_id": "sf-ts-missing-timeout",
+      "project_type": "single_frontend",
+      "language": "TypeScript",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": false,
+      "title": "New external request has no timeout",
+      "changed_files": [
+        {
+          "path": "src/api.ts",
+          "diff": "@@ -0,0 +1,3 @@\n+export async function loadUser(id: string) {\n+  return fetch(`/api/users/${id}`);\n+}"
+        }
+      ],
+      "expected_findings": [
+        {
+          "rule_id": "reliability.external-call-timeout",
+          "file_path": "src/api.ts",
+          "line_start": 2,
+          "line_end": 2,
+          "severity": "medium"
+        }
+      ]
+    },
+    {
+      "case_id": "mono-ts-package-boundary",
+      "project_type": "monorepo",
+      "language": "TypeScript",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": false,
+      "title": "Package imports another package's private source",
+      "changed_files": [
+        {
+          "path": "packages/web/src/session.ts",
+          "diff": "@@ -0,0 +1 @@\n+import { secretKey } from '../../auth/src/internal/keys';"
+        }
+      ],
+      "expected_findings": [
+        {
+          "rule_id": "compatibility.package-public-api",
+          "file_path": "packages/web/src/session.ts",
+          "line_start": 1,
+          "line_end": 1,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "mono-ts-clean-public-export",
+      "project_type": "monorepo",
+      "language": "TypeScript",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": true,
+      "title": "Package uses the public export",
+      "changed_files": [
+        {
+          "path": "packages/web/src/session.ts",
+          "diff": "@@ -1 +1 @@\n-import { key } from '../../auth/src/internal/keys';\n+import { key } from '@workspace/auth';"
+        }
+      ],
+      "expected_findings": []
+    },
+    {
+      "case_id": "mono-ts-breaking-export",
+      "project_type": "monorepo",
+      "language": "TypeScript",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": false,
+      "title": "Public export is removed while consumers still import it",
+      "changed_files": [
+        {
+          "path": "packages/auth/src/index.ts",
+          "diff": "@@ -1,2 +1 @@\n export { login } from './login';\n-export { logout } from './logout';"
+        },
+        {
+          "path": "packages/web/src/menu.ts",
+          "diff": "@@ -0,0 +1 @@\n+import { logout } from '@workspace/auth';"
+        }
+      ],
+      "expected_findings": [
+        {
+          "rule_id": "compatibility.breaking-public-api",
+          "file_path": "packages/auth/src/index.ts",
+          "line_start": null,
+          "line_end": null,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "mixed-py-sql-injection",
+      "project_type": "mixed_frontend_backend",
+      "language": "Python",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": false,
+      "title": "User input is interpolated into SQL",
+      "changed_files": [
+        {
+          "path": "backend/users.py",
+          "diff": "@@ -0,0 +1,2 @@\n+def find_user(name):\n+    return db.execute(f\"select * from users where name = '{name}'\")"
+        }
+      ],
+      "expected_findings": [
+        {
+          "rule_id": "security.sql-injection",
+          "file_path": "backend/users.py",
+          "line_start": 2,
+          "line_end": 2,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "case_id": "mixed-ts-response-contract",
+      "project_type": "mixed_frontend_backend",
+      "language": "TypeScript",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": false,
+      "title": "Frontend reads a field removed by the backend change",
+      "changed_files": [
+        {
+          "path": "frontend/user.ts",
+          "diff": "@@ -0,0 +1,2 @@\n+const user = await api.getUser(id);\n+return user.displayName;"
+        },
+        {
+          "path": "backend/users.py",
+          "diff": "@@ -4 +4 @@\n-    return {'displayName': user.name}\n+    return {'name': user.name}"
+        }
+      ],
+      "expected_findings": [
+        {
+          "rule_id": "compatibility.response-contract",
+          "file_path": "frontend/user.ts",
+          "line_start": 2,
+          "line_end": 2,
+          "severity": "high"
+        }
+      ]
+    },
+    {
+      "case_id": "mixed-clean-contract-update",
+      "project_type": "mixed_frontend_backend",
+      "language": "TypeScript",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": true,
+      "title": "Frontend and backend update the response contract together",
+      "changed_files": [
+        {
+          "path": "frontend/user.ts",
+          "diff": "@@ -2 +2 @@\n-return user.displayName;\n+return user.name;"
+        },
+        {
+          "path": "backend/users.py",
+          "diff": "@@ -4 +4 @@\n-return {'displayName': user.name}\n+return {'name': user.name}"
+        }
+      ],
+      "expected_findings": []
+    },
+    {
+      "case_id": "backend-go-context-loss",
+      "project_type": "backend_service",
+      "language": "Go",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": false,
+      "title": "Request context is replaced before a database call",
+      "changed_files": [
+        {
+          "path": "internal/users/service.go",
+          "diff": "@@ -8 +8,2 @@\n-row := db.QueryRowContext(ctx, query, id)\n+background := context.Background()\n+row := db.QueryRowContext(background, query, id)"
+        }
+      ],
+      "expected_findings": [
+        {
+          "rule_id": "reliability.request-context-propagation",
+          "file_path": "internal/users/service.go",
+          "line_start": 10,
+          "line_end": 10,
+          "severity": "medium"
+        }
+      ]
+    },
+    {
+      "case_id": "backend-go-clean-context",
+      "project_type": "backend_service",
+      "language": "Go",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": true,
+      "title": "Database call keeps the request context",
+      "changed_files": [
+        {
+          "path": "internal/users/service.go",
+          "diff": "@@ -8 +8 @@\n-row := db.QueryRow(query, id)\n+row := db.QueryRowContext(ctx, query, id)"
+        }
+      ],
+      "expected_findings": []
+    },
+    {
+      "case_id": "backend-py-auth-bypass",
+      "project_type": "backend_service",
+      "language": "Python",
+      "origin": "synthetic",
+      "adjudication_status": "pending_human",
+      "clean": false,
+      "title": "Administrative endpoint no longer checks the caller role",
+      "changed_files": [
+        {
+          "path": "app/admin.py",
+          "diff": "@@ -3,3 +3 @@\n def delete_user(user_id, actor):\n-    if not actor.is_admin:\n-        raise Forbidden()\n     repository.delete(user_id)"
+        }
+      ],
+      "expected_findings": [
+        {
+          "rule_id": "security.authorization-check-removed",
+          "file_path": "app/admin.py",
+          "line_start": null,
+          "line_end": null,
+          "severity": "critical"
+        }
+      ]
+    }
+  ]
+}

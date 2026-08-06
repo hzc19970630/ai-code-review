@@ -1,0 +1,35 @@
+version: 1
+
+profile:
+  source_dirs:
+    - src
+    - services/api/src
+  test_dirs:
+    - tests
+    - services/api/tests
+  generated_dirs:
+    - dist
+    - generated
+  key_paths:
+    - src/public-api.ts
+    - services/api/src/auth.py
+  standards:
+    - .ai-review/architecture.md
+    - .ai-review/testing.md
+  companion_patterns:
+    - match: src/auth/**
+      paths:
+        - src/public-api.ts
+        - tests/auth.integration.test.ts
+
+rules:
+  # Repository settings can only narrow the platform allowlist.
+  enable:
+    - correctness
+    - security
+  disable:
+    - reliability
+  path_rules:
+    - match: tests/**
+      disable:
+        - api_compatibility

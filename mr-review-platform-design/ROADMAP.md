@@ -95,6 +95,9 @@ P1 可以先用固定 ReviewResult 完成链路，不要求真实模型质量。
 - 定义版本化 ReviewResult/Finding JSON Schema。
 - 接入首个 LLM Provider，记录 Prompt 版本、用量、耗时和错误。
 - 实现一次修复调用、确定性 Verifier、Finding 指纹和去重。
+- 定义版本化 literal Evidence 契约、新侧新增行映射、有限 Evidence Normalizer 和稳定校验码。
+- 建立固定版本 `SyntaxAnalyzerPort + Registry`，首批支持 TS/TSX、Python、JSON 和 YAML 单文件语法解析；Analyzer Catalog 冻结进 EffectiveReviewPlan。
+- 将 Analyzer 诊断映射为统一 Finding，并把不可用、超时、崩溃、超大文件和不支持类型记录为 ContextManifest 稳定 reason code。
 - 实现 Findings 持久化和 Markdown Renderer。
 - 实现 GitLab Note create/update，并保存 `gitlab_note_id`。
 - 在评论中展示覆盖范围和跳过原因。
@@ -105,6 +108,10 @@ P1 可以先用固定 ReviewResult 完成链路，不要求真实模型质量。
 - 删除/重命名、无后缀文件、二进制和 `too_large` 测试
 - Schema 无效、模型超时和修复失败测试
 - Finding 文件、行号、证据和指纹校验测试
+- 合法定位包装不得误拒绝；错误文件、错误行号、跨位置命中和语义改写不得通过
+- TS/TSX、Python、JSON、YAML 合法/非法语法 Fixture；关闭 LLM 后 MR `!32` 仍检出 `export const s;`
+- Analyzer 版本冻结、不可用、超时、崩溃、资源上限、恶意配置和不执行仓库脚本测试
+- Analyzer 与 LLM 同位置重复报告只保留确定性 Finding
 - Prompt Injection Fixture
 - GitLab Note 重试不重复测试
 - Golden Dataset 离线回归
@@ -113,6 +120,9 @@ P1 可以先用固定 ReviewResult 完成链路，不要求真实模型质量。
 
 - 累计至少 100 个 Batch 响应，允许一次修复后最终解析失败数为 0；样本不足时只报告原始分子和分母。
 - 无效模型输出不会直接写入 GitLab。
+- 真实 Shadow MR `!32` 的已知编译错误通过 Verifier，且 GitLab Writer 调用仍为 0。
+- 关闭 LLM 时，真实 Shadow MR `!32` 的已知 TypeScript 语法错误仍可由固定版本 Analyzer 定位；语法阶段 LLM Token 使用为 0。
+- Analyzer 运行失败显示 partial Coverage 和稳定 reason code，不得输出“未发现问题”。
 - 同一任务重试不产生重复 Note。
 - 每个任务可查询 Context 覆盖、模型版本、Token、耗时和失败原因。
 - Golden Dataset 中 `critical/high` Finding 全部经过人工复核。
@@ -230,5 +240,6 @@ code + migration + tests + observability + security + docs + rollback
 6. 实现 GitLab Adapter 及 Mock 契约测试。
 7. 建立 ReviewResult/Finding Schema。
 8. 实现 diff parser、Context Builder 和 Verifier。
-9. 接入一个模型和 LLMRun 记录。
-10. 完成 GitLab 汇总评论和首个端到端测试。
+9. 实现确定性 SyntaxAnalyzer Registry 和首批语言 Adapter。
+10. 接入一个模型和 LLMRun 记录。
+11. 完成 GitLab 汇总评论和首个端到端测试。

@@ -36,6 +36,8 @@ def _finding(*, validation_status: str) -> VerifiedFinding:
         draft=FindingDraft(
             severity="medium",
             category="api_compatibility",
+            rule_id="api_compatibility.general",
+            scope="diff_line",
             file_path="src/app.py",
             line_start=2,
             title="A concrete API regression was found",

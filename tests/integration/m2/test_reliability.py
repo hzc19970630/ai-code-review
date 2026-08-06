@@ -152,10 +152,13 @@ def test_dispatcher_crash_after_redis_enqueue_is_recovered(m2_runtime) -> None:
     assert Job.fetch(f"review-{job_id}", connection=m2_runtime.redis).get_status() == "queued"
 
     assert dispatch_outbox_once(m2_runtime.settings) == 1
-    assert Queue(
-        m2_runtime.settings.rq_queue_name,
-        connection=m2_runtime.redis,
-    ).count == 1
+    assert (
+        Queue(
+            m2_runtime.settings.rq_queue_name,
+            connection=m2_runtime.redis,
+        ).count
+        == 1
+    )
     with m2_runtime.database.session() as session:
         event = session.scalar(select(OutboxEvent))
         assert event is not None
@@ -274,6 +277,8 @@ def test_two_workers_claim_one_job_and_create_one_result(
                         FindingDraft(
                             severity="high",
                             category="correctness",
+                            rule_id="correctness.general",
+                            scope="diff_line",
                             file_path="src/app.py",
                             line_start=2,
                             line_end=2,
@@ -400,6 +405,8 @@ def test_worker_crash_matrix_recovers_without_duplicate_business_result(
                         FindingDraft(
                             severity="high",
                             category="correctness",
+                            rule_id="correctness.general",
+                            scope="diff_line",
                             file_path="src/app.py",
                             line_start=2,
                             line_end=2,

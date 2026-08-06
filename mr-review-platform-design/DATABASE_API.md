@@ -158,6 +158,7 @@ INDEX (enabled)
 | `llm_model` | `VARCHAR(128)` | NULL | 项目级模型名 |
 | `llm_credential_ref` | `VARCHAR(255)` | NULL | 模型凭据引用，通常由网关统一提供 |
 | `data_policy` | `VARCHAR(32)` | NOT NULL DEFAULT `internal_only` | 代码数据出域策略 |
+| `publish_mode` | `VARCHAR(32)` | NOT NULL DEFAULT `publish` | `publish` 写 GitLab；`shadow` 只保存结果 |
 | `supported_extensions` | `TEXT[]` | NOT NULL | 支持审查的文件后缀 |
 | `ignore_paths` | `JSONB` | NOT NULL DEFAULT `[]` | 忽略路径 |
 | `enabled_rules` | `JSONB` | NOT NULL DEFAULT `[]` | 启用规则 |
@@ -229,6 +230,8 @@ UNIQUE (delivery_id) WHERE delivery_id IS NOT NULL
 | `prompt_version` | `VARCHAR(64)` | NOT NULL | 可复现的 Prompt 版本 |
 | `result_schema_version` | `VARCHAR(32)` | NOT NULL | 结构化输出 Schema 版本 |
 | `config_snapshot` | `JSONB` | NOT NULL | 去除 Secret 后的项目配置快照 |
+| `effective_plan` | `JSONB` | NULL | M3.0 不可变执行计划；历史任务允许为空并从自身快照补建一次 |
+| `plan_hash` | `VARCHAR(64)` | NULL | EffectiveReviewPlan 规范化 JSON 的 SHA-256 |
 | `attempt_count` | `INTEGER` | NOT NULL DEFAULT 0 | 已执行次数 |
 | `max_attempts` | `INTEGER` | NOT NULL DEFAULT 3 | 最大执行次数 |
 | `next_retry_at` | `TIMESTAMPTZ` | NULL | 下次允许重试时间 |
@@ -258,6 +261,8 @@ INDEX (project_id, status)
 INDEX (mr_iid)
 INDEX (status, next_retry_at)
 ```
+
+M3.2.1 起 `effective_plan` 增加 `syntax_catalog_version` 和 `syntax_analyzers[]`，每项至少包含 `analyzer_id`、固定 `version` 和 `config_hash`。这些字段参与 Canonical JSON 与 `plan_hash`；任务重试时所需版本缺失应失败为 `ANALYZER_UNAVAILABLE`，禁止读取当前 Catalog 自动升级。
 
 ### 4.4.1 outbox_events
 
@@ -308,13 +313,14 @@ INDEX (review_job_id, created_at)
 | `line_end` | `INTEGER` | NULL | 结束行 |
 | `title` | `VARCHAR(255)` | NOT NULL | 问题标题 |
 | `description` | `TEXT` | NOT NULL | 问题描述 |
-| `evidence` | `TEXT` | NULL | 证据 |
+| `evidence` | `TEXT` | NULL | 模型看到的 literal source quote，不重复路径和行号 |
 | `suggestion` | `TEXT` | NULL | 修复建议 |
 | `confidence` | `INTEGER` | NOT NULL DEFAULT 70 | 置信度，0 到 100 |
 | `fingerprint` | `VARCHAR(128)` | NOT NULL | 归一化问题指纹 |
 | `validation_status` | `VARCHAR(32)` | NOT NULL | Verifier 结果 |
+| `validation_code` | `VARCHAR(64)` | NULL | 稳定校验码，供 API、指标和回归测试使用 |
 | `validation_message` | `TEXT` | NULL | 脱敏校验失败原因 |
-| `source_pass` | `VARCHAR(64)` | NOT NULL DEFAULT `review` | 产生问题的批次或 Pass |
+| `source_pass` | `VARCHAR(64)` | NOT NULL DEFAULT `review` | 来源 Pass；LLM 使用 `review`/Batch 标识，语法诊断使用 `syntax:<analyzer_id>@<version>` |
 | `status` | `VARCHAR(32)` | NOT NULL DEFAULT `open` | 状态 |
 | `gitlab_discussion_id` | `VARCHAR(255)` | NULL | 二期行级评论使用 |
 | `gitlab_note_id` | `VARCHAR(128)` | NULL | 关联 GitLab 评论 |
@@ -331,6 +337,8 @@ INDEX (project_id, mr_iid, head_sha)
 INDEX (file_path)
 UNIQUE (review_job_id, fingerprint)
 ```
+
+M3.2.1 不新增 `analyzer_runs` 表：Analyzer 版本和选择结果保存在 EffectiveReviewPlan，逐文件 `ok | failed | skipped`、稳定 reason code 和耗时复用 M3.1 ContextManifest，确定性诊断直接保存为 Finding。`rule_id` 使用稳定的 `syntax.<language>.<diagnostic_code>`；只有独立审计、查询量或扩缩容数据证明现有结构不足时再增加专用运行表。
 
 ### 4.6 feedbacks
 
@@ -363,18 +371,24 @@ INDEX (action)
 |---|---|---|---|
 | `id` | `BIGSERIAL` | PK | 调用 ID |
 | `review_job_id` | `BIGINT` | FK, NOT NULL | 关联审查任务 |
-| `stage` | `VARCHAR(64)` | NOT NULL | `review`、`verifier`、`summary` |
+| `stage` | `VARCHAR(64)` | NOT NULL | 当前实现为 `review` 或 `repair` |
 | `provider` | `VARCHAR(64)` | NOT NULL | 模型供应商 |
 | `model` | `VARCHAR(128)` | NOT NULL | 模型名称 |
 | `prompt_profile` | `VARCHAR(64)` | NOT NULL | Prompt Profile |
 | `prompt_version` | `VARCHAR(64)` | NOT NULL | Prompt 版本 |
+| `batch_key` | `VARCHAR(96)` | NULL | M3.3 稳定批次身份 |
+| `batch_index` | `INTEGER` | NULL | 批次序号 |
+| `batch_count` | `INTEGER` | NULL | 计划批次数 |
+| `job_attempt_no` | `INTEGER` | NULL | ReviewJob 执行尝试序号 |
+| `call_no` | `INTEGER` | NULL | 当前批次内真实 HTTP 调用序号 |
+| `transport_attempt_no` | `INTEGER` | NULL | 当前初始或 Repair 请求的传输尝试序号 |
 | `request_hash` | `VARCHAR(128)` | NULL | 脱敏请求内容哈希 |
-| `attempt_no` | `INTEGER` | NOT NULL DEFAULT 1 | 同一阶段调用次数 |
+| `attempt_no` | `INTEGER` | NOT NULL DEFAULT 1 | 逻辑请求序号，1 为初始，2 为 Repair |
 | `prompt_tokens` | `INTEGER` | NULL | 输入 token |
 | `completion_tokens` | `INTEGER` | NULL | 输出 token |
 | `total_tokens` | `INTEGER` | NULL | 总 token |
 | `duration_ms` | `INTEGER` | NULL | 耗时 |
-| `status` | `VARCHAR(32)` | NOT NULL | `succeeded` 或 `failed` |
+| `status` | `VARCHAR(32)` | NOT NULL | `running`、`succeeded`、`failed` 或 `unknown` |
 | `error_code` | `VARCHAR(64)` | NULL | 稳定错误码 |
 | `error_message` | `TEXT` | NULL | 脱敏失败原因 |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL DEFAULT now() | 创建时间 |
@@ -483,6 +497,7 @@ erDiagram
         string status
         string fingerprint
         string validation_status
+        string validation_code
     }
 
     feedbacks {
@@ -740,6 +755,8 @@ Query：
 | `status` | `string` | 状态 |
 | `category` | `string` | 分类 |
 | `file_path` | `string` | 文件路径 |
+| `validation_status` | `string` | `valid/rejected/needs_review` |
+| `validation_code` | `string` | 稳定校验码 |
 | `page` | `integer` | 页码 |
 | `page_size` | `integer` | 每页数量 |
 
@@ -755,15 +772,19 @@ Query：
   "review_job_id": 1001,
   "project_id": 1,
   "severity": "high",
-  "category": "api_compatibility",
-  "file_path": "packages/elements/src/button/index.tsx",
-  "line_start": 42,
-  "line_end": 45,
-  "title": "Button props 删除了已发布字段",
-  "description": "已发布组件的 props 字段被删除，可能导致调用方编译失败。",
-  "evidence": "diff 中删除了 ButtonProps.xxx 字段。",
-  "suggestion": "保留旧字段并标记 deprecated，或提供迁移说明。",
-  "confidence": 85,
+  "category": "correctness",
+  "rule_id": "correctness",
+  "file_path": "main.tsx",
+  "line_start": 1,
+  "line_end": 1,
+  "title": "const 声明缺少初始化值",
+  "description": "TypeScript 编译将失败。",
+  "evidence": "export const s;",
+  "suggestion": "为常量提供初始化值，或删除无效声明。",
+  "confidence": 98,
+  "validation_status": "valid",
+  "validation_code": null,
+  "validation_message": null,
   "status": "open"
 }
 ```

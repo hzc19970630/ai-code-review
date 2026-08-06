@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ssl
 import time
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -9,6 +10,24 @@ import httpx
 
 from mr_review_platform.config import Settings
 from mr_review_platform.errors import ExternalServiceError
+
+MAX_MR_DIFFS = 1_000
+
+
+def _stable_diffs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        items,
+        key=lambda item: (
+            str(item.get("new_path") or item.get("old_path") or ""),
+            str(item.get("old_path") or ""),
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class RepositoryTree:
+    paths: tuple[str, ...]
+    truncated: bool
 
 
 class GitLabClient:
@@ -124,10 +143,61 @@ class GitLabClient:
             params={"access_raw_diffs": "true"},
         )
         data = response.json()
+        diff_refs = data.get("diff_refs") if isinstance(data.get("diff_refs"), dict) else {}
+        changes = data.get("changes") or []
+        overflow = bool(data.get("overflow"))
+        overflow_reason: str | None = None
+        if overflow:
+            try:
+                changes, truncated = self._get_merge_request_diffs(project_id, mr_iid)
+            except ExternalServiceError:
+                overflow_reason = "GITLAB_DIFF_FETCH_FAILED"
+            else:
+                overflow = truncated
+                if truncated:
+                    overflow_reason = "GITLAB_DIFF_LIST_TRUNCATED"
         return {
-            "changes": data.get("changes") or [],
-            "overflow": bool(data.get("overflow")),
+            "changes": changes,
+            "overflow": overflow,
+            "overflow_reason": overflow_reason,
+            "head_sha": str(data.get("sha") or diff_refs.get("head_sha") or ""),
+            "diff_refs": diff_refs,
         }
+
+    def _get_merge_request_diffs(
+        self,
+        project_id: str,
+        mr_iid: int,
+        *,
+        max_diffs: int = MAX_MR_DIFFS,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        diffs: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            response = self._request(
+                "GET",
+                f"/api/v4/projects/{self._project(project_id)}/merge_requests/{mr_iid}/diffs",
+                params={
+                    "per_page": min(100, max_diffs),
+                    "page": page,
+                    "access_raw_diffs": "true",
+                },
+            )
+            items = response.json()
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                raise ExternalServiceError(
+                    "GitLab merge request diffs response is invalid",
+                    code="GITLAB_RESPONSE_INVALID",
+                    retryable=False,
+                )
+            remaining = max_diffs - len(diffs)
+            diffs.extend(items[:remaining])
+            next_page = response.headers.get("X-Next-Page")
+            if len(items) > remaining or (len(diffs) >= max_diffs and next_page):
+                return _stable_diffs(diffs), True
+            if not next_page:
+                return _stable_diffs(diffs), False
+            page = int(next_page)
 
     def get_file(self, project_id: str, file_path: str, ref: str) -> str | None:
         encoded_path = quote(file_path, safe="")
@@ -145,6 +215,48 @@ class GitLabClient:
         if "application/octet-stream" in content_type or b"\x00" in response.content[:8192]:
             return None
         return response.text
+
+    def list_repository_tree(
+        self,
+        project_id: str,
+        ref: str,
+        *,
+        max_entries: int = 500,
+    ) -> RepositoryTree:
+        if max_entries < 1:
+            raise ValueError("max_entries must be positive")
+        paths: list[str] = []
+        page = 1
+        while True:
+            response = self._request(
+                "GET",
+                f"/api/v4/projects/{self._project(project_id)}/repository/tree",
+                params={
+                    "ref": ref,
+                    "recursive": "true",
+                    "per_page": min(100, max_entries),
+                    "page": page,
+                },
+            )
+            items = response.json()
+            if not isinstance(items, list):
+                raise ExternalServiceError(
+                    "GitLab repository tree response is invalid",
+                    code="GITLAB_RESPONSE_INVALID",
+                    retryable=False,
+                )
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") != "blob":
+                    continue
+                path = str(item.get("path") or "")
+                if path:
+                    paths.append(path)
+                if len(paths) >= max_entries:
+                    return RepositoryTree(paths=tuple(sorted(set(paths))), truncated=True)
+            next_page = response.headers.get("X-Next-Page")
+            if not next_page:
+                return RepositoryTree(paths=tuple(sorted(set(paths))), truncated=False)
+            page = int(next_page)
 
     def create_note(self, project_id: str, mr_iid: int, body: str) -> str:
         response = self._request(

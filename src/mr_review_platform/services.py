@@ -41,9 +41,13 @@ class ProjectRegistration:
     webhook_secret_ref: str
     git_token_ref: str
     supported_extensions: list[str]
+    publish_mode: str = "publish"
 
 
 def register_project(session: Session, registration: ProjectRegistration) -> Project:
+    if registration.publish_mode not in {"publish", "shadow"}:
+        raise ValueError("publish_mode must be publish or shadow")
+
     existing = session.scalar(
         select(Project).where(
             Project.provider == "gitlab",
@@ -75,6 +79,7 @@ def register_project(session: Session, registration: ProjectRegistration) -> Pro
             prompt_profile="default",
             llm_provider="openai-compatible",
             data_policy="internal_only",
+            publish_mode=registration.publish_mode,
             supported_extensions=registration.supported_extensions,
             ignore_paths=[
                 "**/node_modules/**",
@@ -96,14 +101,22 @@ def register_project(session: Session, registration: ProjectRegistration) -> Pro
     return project
 
 
-def project_config_snapshot(config: ProjectConfig) -> dict[str, object]:
+def project_config_snapshot(
+    config: ProjectConfig,
+    *,
+    default_llm_model: str | None = None,
+    default_llm_credential_ref: str | None = None,
+) -> dict[str, object]:
     return {
         "config_version": config.config_version,
+        "review_enabled": config.review_enabled,
         "review_strategy": config.review_strategy,
         "prompt_profile": config.prompt_profile,
         "llm_provider": config.llm_provider,
-        "llm_model": config.llm_model,
+        "llm_model": config.llm_model or default_llm_model,
+        "llm_credential_ref": config.llm_credential_ref or default_llm_credential_ref,
         "data_policy": config.data_policy,
+        "publish_mode": config.publish_mode,
         "supported_extensions": list(config.supported_extensions),
         "ignore_paths": list(config.ignore_paths),
         "enabled_rules": list(config.enabled_rules),
