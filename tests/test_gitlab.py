@@ -110,6 +110,55 @@ def test_gitlab_repository_tree_is_paginated_and_bounded() -> None:
     assert bounded.truncated is True
 
 
+def test_gitlab_compare_heads_returns_stable_delta_and_timeout_status() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["from"] == "a" * 40
+        assert request.url.params["to"] == "b" * 40
+        assert request.url.params["straight"] == "true"
+        return httpx.Response(
+            200,
+            json={
+                "compare_timeout": True,
+                "diffs": [
+                    {"old_path": "z.py", "new_path": "z.py", "diff": "+z"},
+                    {"old_path": "a.py", "new_path": "a.py", "diff": "+a"},
+                ],
+            },
+        )
+
+    with GitLabClient(_settings(), "token", transport=httpx.MockTransport(handler)) as client:
+        result = client.compare_heads("123", "a" * 40, "b" * 40)
+
+    assert [item["new_path"] for item in result.diffs] == ["a.py", "z.py"]
+    assert result.truncated is True
+    assert result.is_descendant is False
+
+
+def test_gitlab_compare_proves_descendant_from_returned_parent_graph() -> None:
+    before = "a" * 40
+    middle = "b" * 40
+    after = "c" * 40
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "compare_timeout": False,
+                "commits": [
+                    {"id": middle, "parent_ids": [before]},
+                    {"id": after, "parent_ids": [middle]},
+                ],
+                "diffs": [],
+            },
+        )
+
+    with GitLabClient(_settings(), "token", transport=httpx.MockTransport(handler)) as client:
+        result = client.compare_heads("123", before, after)
+
+    assert result.truncated is False
+    assert result.is_descendant is True
+
+
 def test_overflowed_changes_are_recovered_from_paginated_diffs() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/changes"):

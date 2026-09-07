@@ -27,7 +27,7 @@ def _settings() -> Settings:
 
 def _valid_review() -> dict:
     return {
-        "summary": "No verified issues.",
+        "summary": "未发现通过验证的问题。",
         "coverage": {"reviewed_files": 1, "skipped_files": 0, "limitations": []},
         "findings": [],
     }
@@ -75,7 +75,7 @@ def test_llm_adapter_parses_structured_result_and_usage() -> None:
     ) as client:
         output = client.review({"changes": []})
 
-    assert output.result.summary == "No verified issues."
+    assert output.result.summary == "未发现通过验证的问题。"
     assert output.calls[0].total_tokens == 15
     assert len(output.request_hash) == 64
 
@@ -101,6 +101,38 @@ def test_llm_adapter_repairs_invalid_first_response() -> None:
     assert [call.request_hash for call in output.calls] == actual_request_hashes
     assert output.request_hash == actual_request_hashes[0]
     assert actual_request_hashes[0] != actual_request_hashes[1]
+
+
+def test_llm_adapter_repairs_schema_valid_english_output_to_chinese() -> None:
+    call_count = 0
+    repair_payload: dict | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count, repair_payload
+        call_count += 1
+        payload = json.loads(request.content)
+        if call_count == 1:
+            content = json.dumps(
+                {
+                    "summary": "No verified issues.",
+                    "coverage": {"reviewed_files": 1, "skipped_files": 0},
+                    "findings": [],
+                }
+            )
+        else:
+            repair_payload = payload
+            content = json.dumps(_valid_review(), ensure_ascii=False)
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    with OpenAICompatibleLLM(
+        _settings(), api_key="key", transport=httpx.MockTransport(handler)
+    ) as client:
+        output = client.review(_envelope())
+
+    assert call_count == 2
+    assert output.result.summary == "未发现通过验证的问题。"
+    assert repair_payload is not None
+    assert "Simplified Chinese" in repair_payload["messages"][1]["content"]
 
 
 def test_llm_adapter_classifies_non_retryable_request_error() -> None:

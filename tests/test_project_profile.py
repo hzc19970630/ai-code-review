@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from mr_review_platform.project_profile import ProjectProfiler, select_related_paths
+from mr_review_platform.project_profile import (
+    ProjectProfiler,
+    build_profile_slice,
+    select_direct_import_paths,
+    select_related_paths,
+)
 
 
 def _build(files: dict[str, str], *, ref: str = "b" * 40):
@@ -61,6 +66,8 @@ def test_profiles_javascript_monorepo() -> None:
 def test_profiles_mixed_frontend_and_backend_repository() -> None:
     files = {
         ".ai-review.yml": """version: 1
+supported_extensions: [.PY, .ts, .tsx]
+ignore_paths: [dist/**, "**/generated/**"]
 profile:
   source_dirs: [web/src, services/api/src]
   test_dirs: [web/tests, services/api/tests]
@@ -100,6 +107,8 @@ serve = "api.main:run"
     assert profile.standards[0].content == "HTTP handlers must call the service layer."
     assert profile.standards[0].source_ref == "b" * 40
     assert profile.companion_patterns[0].match == "web/src/**"
+    assert profile.review_scope.supported_extensions == (".py", ".ts", ".tsx")
+    assert profile.review_scope.ignore_paths == ("**/generated/**", "dist/**")
     assert profile.rule_config.disable == ("reliability",)
     assert profile.rule_config.path_rules[0].match == "web/src/**"
     assert profile.rule_config.path_rules[0].disable == ("api_compatibility",)
@@ -159,6 +168,9 @@ def test_profile_is_stable_and_records_source_provenance() -> None:
         "version: 1\nprofile:\n  standards: [../secret.md]\n",
         "version: 1\nprofile:\n  standards: [config.env]\n",
         "version: 1\nprofile:\n  unexpected: true\n",
+        "version: 1\nsupported_extensions: [ts]\n",
+        "version: 1\nsupported_extensions: []\n",
+        "version: 1\nignore_paths: [../secret/**]\n",
         "version: 1\nprofile: &profile\n  source_dirs: [src]\ncopy: *profile\n",
     ],
 )
@@ -174,6 +186,14 @@ def test_profile_rejects_untrusted_or_unknown_repository_configuration(config: s
 
     assert "PROFILE_CONFIG_INVALID" in profile.limitations
     assert profile.standards == ()
+
+
+def test_profile_without_scope_overrides_keeps_legacy_content_hash_shape() -> None:
+    profile = _build({".ai-review.yml": "version: 1\nprofile: {}\n"})
+
+    assert profile.review_scope.supported_extensions is None
+    assert profile.review_scope.ignore_paths is None
+    assert "review_scope" not in profile.canonical_data()
 
 
 def test_profile_enforces_file_and_character_budgets() -> None:
@@ -283,3 +303,36 @@ profile:
         ("web/src/public-api.ts", "companion_pattern:web/src/**"),
         ("services/api/src/auth.py", "project_key_path"),
     ]
+
+
+def test_profile_slice_is_path_focused_and_direct_import_can_bypass_tree_window() -> None:
+    files = {
+        ".ai-review.yml": """version: 1
+profile:
+  standards: [docs/frontend.md, services/api/README.md]
+""",
+        "package.json": '{"dependencies":{"react":"19"}}',
+        "web/src/App.tsx": "import { api } from './public-api';\nexport const App = api;",
+        "web/src/public-api.ts": "export const api = true;",
+        "docs/frontend.md": "frontend standard",
+        "services/api/README.md": "backend standard",
+    }
+    profile = _build(files)
+
+    selected = select_direct_import_paths(
+        changed_contents={"web/src/App.tsx": files["web/src/App.tsx"]},
+        repository_paths=("web/src/App.tsx",),
+        profile=profile,
+        file_loader=files.get,
+    )
+    profile_slice = build_profile_slice(profile, paths=["web/src/App.tsx"])
+
+    assert [(item.path, item.reason) for item in selected] == [
+        ("web/src/public-api.ts", "direct_import")
+    ]
+    assert profile_slice["schema_version"] == "project-profile-slice/v1"
+    assert profile_slice["profile_hash"] == profile.content_hash
+    assert len(profile_slice["slice_hash"]) == 64
+    assert len(profile.standards) == 2
+    assert len(profile_slice["standards"]) <= 2
+    assert sum(len(item["content"]) for item in profile_slice["standards"]) <= 4_000

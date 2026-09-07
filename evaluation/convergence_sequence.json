@@ -1,0 +1,39 @@
+{
+  "schema_version": "convergence-sequence/v1",
+  "sequence_id": "example-fix-converges",
+  "heads": [
+    {
+      "review_job_id": 1,
+      "head_sha": "1111111111111111111111111111111111111111",
+      "change_kind": "baseline",
+      "workset_coverage": "full",
+      "context_sufficiency": "sufficient",
+      "previous_open_fingerprints": [],
+      "transitions": [],
+      "findings": [
+        {
+          "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "origin_scope": "cumulative",
+          "publication_status": "published"
+        }
+      ]
+    },
+    {
+      "review_job_id": 2,
+      "head_sha": "2222222222222222222222222222222222222222",
+      "change_kind": "fix_only",
+      "workset_coverage": "full",
+      "context_sufficiency": "sufficient",
+      "previous_open_fingerprints": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "transitions": [
+        {
+          "previous_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "state": "resolved"
+        }
+      ],
+      "findings": []
+    }
+  ]
+}

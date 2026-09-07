@@ -50,12 +50,24 @@ def _changes(count: int) -> list[dict[str, object]]:
     ]
 
 
+def _segmented_change() -> list[dict[str, object]]:
+    lines = [f'+value_{index} = "{("x" * 100)}"' for index in range(400)]
+    return [
+        {
+            "old_path": "src/huge.py",
+            "new_path": "src/huge.py",
+            "diff": "@@ -0,0 +1,400 @@\n" + "\n".join(lines),
+        }
+    ]
+
+
 def _context(
     raw_changes,
     *,
     max_input_tokens=20_000,
     related_paths=None,
     file_content="def related():\n    return True\n",
+    segment_oversized_diffs=True,
 ):
     profile = generic_project_profile("a" * 40)
     context = build_context_pack(
@@ -70,6 +82,7 @@ def _context(
         related_paths=related_paths,
         project_profile=profile,
         defer_batch_budget=True,
+        segment_oversized_diffs=segment_oversized_diffs,
     )
     return context, profile
 
@@ -81,7 +94,7 @@ def _prompt_hashes(batch_plan, plan, profile):
                 assemble_prompt_envelope(
                     plan,
                     batch.context.to_prompt(),
-                    project_profile=profile.to_prompt(),
+                    project_profile=batch.context.profile_slice or profile.to_prompt(),
                     compiled_rules=batch.compiled_rule_set,
                 )
             )
@@ -156,6 +169,14 @@ def test_manifest_counts_files_only_after_batch_success() -> None:
     assert all(
         batch.estimated_input_tokens <= plan.max_input_tokens for batch in batch_plan.batches
     )
+    assert (
+        batch_plan.batches[0].profile_slice_hash
+        == batch_plan.batches[0].context.profile_slice["slice_hash"]
+    )
+    assert (
+        context.manifest.review_batches[0].profile_slice_hash
+        == batch_plan.batches[0].profile_slice_hash
+    )
 
     _update_batch_manifest(
         context,
@@ -187,3 +208,107 @@ def test_cross_module_related_fallback_cannot_reinflate_batch_over_budget() -> N
     )
     assert related_item.status == "skipped"
     assert related_item.reason_code == "token_budget"
+
+
+def test_segmented_file_is_reviewed_only_after_every_segment_batch_succeeds() -> None:
+    context, profile = _context(
+        _segmented_change(),
+        max_input_tokens=32_000,
+        file_content="\n".join(f'value_{index} = "{("x" * 100)}"' for index in range(400)),
+    )
+    plan = _plan(
+        max_input_tokens=8_000,
+        max_batches=4,
+        max_total_input_tokens=32_000,
+    )
+
+    assert len(context.changes) == 3
+    assert len({change.segment_id for change in context.changes}) == 3
+    batch_plan = plan_review_batches(context=context, plan=plan, project_profile=profile)
+    assert len(batch_plan.batches) == 3
+    assert not batch_plan.omitted
+
+    apply_batch_plan_to_manifest(context, batch_plan)
+    assert context.manifest is not None
+    assert context.manifest.reviewed_files == 0
+
+    _update_batch_manifest(
+        context,
+        batch_key=batch_plan.batches[0].batch_key,
+        status="succeeded",
+    )
+    assert context.manifest.reviewed_files == 0
+
+    for batch in batch_plan.batches[1:]:
+        _update_batch_manifest(context, batch_key=batch.batch_key, status="succeeded")
+
+    assert context.manifest.reviewed_files == 1
+    assert context.manifest.incomplete_files == 0
+    assert context.manifest.terminal_state == "full"
+
+
+def test_failed_segment_keeps_exact_range_and_marks_file_partial() -> None:
+    context, profile = _context(
+        _segmented_change(),
+        max_input_tokens=32_000,
+        file_content="\n".join(f'value_{index} = "{("x" * 100)}"' for index in range(400)),
+    )
+    plan = _plan(
+        max_input_tokens=8_000,
+        max_batches=4,
+        max_total_input_tokens=32_000,
+    )
+    batch_plan = plan_review_batches(context=context, plan=plan, project_profile=profile)
+    apply_batch_plan_to_manifest(context, batch_plan)
+
+    _update_batch_manifest(
+        context,
+        batch_key=batch_plan.batches[0].batch_key,
+        status="succeeded",
+    )
+    _update_batch_manifest(
+        context,
+        batch_key=batch_plan.batches[1].batch_key,
+        status="skipped",
+        reason_code="BATCH_TOTAL_TOKEN_BUDGET",
+    )
+
+    assert context.manifest is not None
+    assert context.manifest.reviewed_files == 0
+    assert context.manifest.incomplete_files == 1
+    assert context.manifest.partially_reviewed_files == 1
+    assert context.manifest.terminal_state == "partial"
+    failed_batch = next(
+        item
+        for item in context.manifest.review_batches
+        if item.batch_key == batch_plan.batches[1].batch_key
+    )
+    assert failed_batch.segments[0].path == "src/huge.py"
+    assert failed_batch.segments[0].segment_index == 2
+    assert failed_batch.segments[0].new_line_start == 139
+    assert failed_batch.segments[0].new_line_end == 275
+
+
+def test_legacy_plan_keeps_legacy_diff_and_batch_planner_semantics() -> None:
+    context, profile = _context(
+        _segmented_change(),
+        max_input_tokens=32_000,
+        segment_oversized_diffs=False,
+    )
+    plan = _plan(
+        max_input_tokens=8_000,
+        max_batches=4,
+        max_total_input_tokens=32_000,
+    ).model_copy(
+        update={
+            "plan_version": "m3.3-v1",
+            "prompt_version": "m3.2.1-zh-v1",
+            "verifier_version": "syntax-priority-v4",
+        }
+    )
+
+    batch_plan = plan_review_batches(context=context, plan=plan, project_profile=profile)
+
+    assert len(context.changes) == 1
+    assert "diff_truncated" in context.changes[0].flags
+    assert batch_plan.planner_version == "batch-planner/v1"

@@ -50,6 +50,7 @@ class Settings:
     dispatch_interval_seconds: int = 1
     outbox_claim_timeout_seconds: int = 300
     enqueue_lock_seconds: int = 60
+    lineage_replacement_window_seconds: int = 7 * 24 * 60 * 60
     log_level: str = "INFO"
 
     @classmethod
@@ -79,6 +80,9 @@ class Settings:
             dispatch_interval_seconds=_as_int("DISPATCH_INTERVAL_SECONDS", 1),
             outbox_claim_timeout_seconds=_as_int("OUTBOX_CLAIM_TIMEOUT_SECONDS", 300),
             enqueue_lock_seconds=_as_int("ENQUEUE_LOCK_SECONDS", 60),
+            lineage_replacement_window_seconds=_as_int(
+                "LINEAGE_REPLACEMENT_WINDOW_SECONDS", 7 * 24 * 60 * 60
+            ),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         )
 

@@ -15,6 +15,7 @@ from mr_review_platform.verifier import (
     RULE_ID_UNKNOWN,
     RULE_NOT_APPLICABLE,
     SCOPE_INVALID,
+    aggregate_verified_findings,
     verify_review_result,
 )
 
@@ -150,6 +151,35 @@ def test_verifier_accepts_real_mr_32_typescript_regression() -> None:
     assert verified[0].validation_status == "valid"
     assert verified[0].validation_code is None
     assert verified[0].draft.evidence == "export const s;"
+
+
+def test_verifier_accepts_finding_from_a_later_diff_segment() -> None:
+    context = _context()
+    context.changes = [
+        context.changes[0],
+        ChangeContext(
+            old_path="src/app.py",
+            new_path="src/app.py",
+            change_type="modified",
+            diff="@@ -20,1 +20,2 @@\n safe = True\n+danger = True",
+            snippet="20: safe = True\n21: danger = True",
+            added_lines={21},
+            additions=1,
+            deletions=0,
+            risk_score=10,
+            segment_index=2,
+            segment_count=2,
+        ),
+    ]
+
+    verified = verify_review_result(
+        _result(line=21, evidence="danger = True"),
+        context,
+        min_confidence=70,
+    )
+
+    assert verified[0].validation_status == "valid"
+    assert verified[0].validation_code is None
 
 
 def test_verifier_rejects_non_added_line() -> None:
@@ -299,3 +329,25 @@ def test_verifier_accepts_mr_scope_only_without_file_location_fields() -> None:
     )
 
     assert verified[0].validation_status == "valid"
+
+
+def test_aggregator_prefers_carry_forward_for_the_same_stable_fingerprint() -> None:
+    fresh = verify_review_result(
+        _result(),
+        _context(),
+        min_confidence=70,
+        compiled_rules=_compiled("correctness"),
+    )[0]
+    carried = fresh.__class__(
+        draft=fresh.draft,
+        fingerprint=fresh.fingerprint,
+        validation_status="valid",
+        validation_code=None,
+        validation_message=None,
+        source_pass="carry-forward",
+    )
+
+    aggregated = aggregate_verified_findings([fresh, carried])
+
+    assert len(aggregated) == 1
+    assert aggregated[0].source_pass == "carry-forward"

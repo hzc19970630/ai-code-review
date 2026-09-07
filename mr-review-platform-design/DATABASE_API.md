@@ -35,6 +35,8 @@ MVP 必做表：
 | `review_jobs` | 一次 MR 审查任务 | 必做 |
 | `outbox_events` | ReviewJob 可靠投递事件 | 必做 |
 | `findings` | 单条结构化审查问题 | 必做 |
+| `review_lineages` | 可证明连续的 MR/Head 变更谱系 | M3.3.4 已实现 |
+| `lineage_finding_states` | 谱系内已验证问题的当前状态投影 | M3.3.4 已实现 |
 | `feedbacks` | 人工反馈记录 | 可后置 |
 | `llm_runs` | 模型、Prompt、成本、耗时和错误记录 | 必做 |
 | `audit_logs` | 管理操作和 GitLab 写操作审计 | 二期必做 |
@@ -98,6 +100,18 @@ accepted | fixed | ignored | false_positive | comment
 
 ```text
 valid | rejected | needs_review
+```
+
+`review_lineages.status`：
+
+```text
+active | dormant | completed
+```
+
+`lineage_finding_states.status`：
+
+```text
+open | resolved | uncertain | not_applicable
 ```
 
 ### 3.4 主键与外键
@@ -213,6 +227,7 @@ UNIQUE (delivery_id) WHERE delivery_id IS NOT NULL
 | `webhook_event_id` | `BIGINT` | FK, NULL | 来源 webhook 事件 |
 | `trigger_type` | `VARCHAR(32)` | NOT NULL DEFAULT `webhook` | `webhook` 或 `manual_rerun` |
 | `parent_review_job_id` | `BIGINT` | FK, NULL | 人工重跑关联的原任务 |
+| `review_lineage_id` | `BIGINT` | FK, NULL | M3.3.4 评审谱系；迁移前历史数据允许为空 |
 | `provider_project_id` | `VARCHAR(128)` | NOT NULL | 冗余 GitLab 项目 ID，便于回写 |
 | `mr_iid` | `INTEGER` | NOT NULL | MR IID |
 | `mr_title` | `TEXT` | NULL | MR 标题 |
@@ -260,6 +275,7 @@ INDEX (project_id, created_at DESC)
 INDEX (project_id, status)
 INDEX (mr_iid)
 INDEX (status, next_retry_at)
+INDEX (review_lineage_id, created_at)
 ```
 
 M3.2.1 起 `effective_plan` 增加 `syntax_catalog_version` 和 `syntax_analyzers[]`，每项至少包含 `analyzer_id`、固定 `version` 和 `config_hash`。这些字段参与 Canonical JSON 与 `plan_hash`；任务重试时所需版本缺失应失败为 `ANALYZER_UNAVAILABLE`，禁止读取当前 Catalog 自动升级。
@@ -293,6 +309,35 @@ INDEX (review_job_id, created_at)
 ```
 
 `publishing` 超过领取超时时间会恢复为 `pending`。即使 Dispatcher 在 Redis 写入成功后、Outbox 更新前崩溃而造成重复投递，Worker 的原子状态抢占仍保证业务副作用只执行一次。
+
+### 4.4.2 review_lineages
+
+保存平台能够证明连续的一次代码变更谱系。它不是 MR、分支或文件的别名；只有关闭未合并的
+旧 MR 在有限窗口内满足唯一候选、分支、目标基线、评审语义和完整 Head 连续性校验时，
+新 MR 才能接续该谱系。
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `BIGSERIAL` | PK | 谱系 ID |
+| `project_id` | `BIGINT` | FK, NOT NULL | 所属项目 |
+| `source_branch` | `VARCHAR(255)` | NULL | 最近确认的源分支 |
+| `target_branch` | `VARCHAR(255)` | NULL | 最近确认的目标分支 |
+| `current_mr_iid` | `INTEGER` | NOT NULL | 当前承载该谱系的 MR |
+| `status` | `VARCHAR(32)` | NOT NULL | `active/dormant/completed` |
+| `latest_observed_head_sha` | `VARCHAR(64)` | NULL | Webhook 最近观察到的 Head，用于拒绝旧 Worker |
+| `current_head_sha` | `VARCHAR(64)` | NULL | 最近成功推进账本的 Head |
+| `target_base_sha` | `VARCHAR(64)` | NULL | 严格继承时使用的目标基线 |
+| `review_semantics_hash` | `VARCHAR(64)` | NULL | Prompt、规则、模型和范围等评审语义哈希 |
+| `version` | `INTEGER` | NOT NULL DEFAULT 1 | 条件更新版本号 |
+| `dormant_at` | `TIMESTAMPTZ` | NULL | 关闭未合并时间，替代窗口从此计算 |
+| `completed_at` | `TIMESTAMPTZ` | NULL | 合并完成时间；completed 不参与自动继承 |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL | 创建时间 |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL | 更新时间 |
+
+```sql
+INDEX (project_id, current_mr_iid)
+INDEX (project_id, status, source_branch, target_branch, dormant_at)
+```
 
 ### 4.5 findings
 
@@ -339,6 +384,37 @@ UNIQUE (review_job_id, fingerprint)
 ```
 
 M3.2.1 不新增 `analyzer_runs` 表：Analyzer 版本和选择结果保存在 EffectiveReviewPlan，逐文件 `ok | failed | skipped`、稳定 reason code 和耗时复用 M3.1 ContextManifest，确定性诊断直接保存为 Finding。`rule_id` 使用稳定的 `syntax.<language>.<diagnostic_code>`；只有独立审计、查询量或扩缩容数据证明现有结构不足时再增加专用运行表。
+
+### 4.5.1 lineage_finding_states
+
+保存 ReviewLineage 内已验证 Finding 的当前投影，`findings` 仍保留每个 ReviewJob 的不可变
+Occurrence。状态表不保存完整模型响应，也不跨 Lineage 自动合并相似问题。
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | `BIGSERIAL` | PK | 状态 ID |
+| `review_lineage_id` | `BIGINT` | FK, NOT NULL | 所属谱系 |
+| `fingerprint` | `VARCHAR(128)` | NOT NULL | 谱系内稳定问题指纹 |
+| `status` | `VARCHAR(32)` | NOT NULL | `open/resolved/uncertain/not_applicable` |
+| `first_review_job_id` | `BIGINT` | FK, NOT NULL | 首次确认该问题的任务 |
+| `latest_review_job_id` | `BIGINT` | FK, NOT NULL | 最近推进状态的任务 |
+| `latest_finding_id` | `BIGINT` | FK, NULL | 最近不可变 Finding Occurrence |
+| `first_head_sha` | `VARCHAR(64)` | NOT NULL | 首次确认 Head |
+| `latest_head_sha` | `VARCHAR(64)` | NOT NULL | 最近验证 Head |
+| `finding_snapshot` | `JSONB` | NOT NULL | 渲染当前 Note 所需的最小 Finding 快照 |
+| `provenance` | `JSONB` | NULL | 文件、规则和依赖哈希等来源证据 |
+| `transition_reason` | `VARCHAR(64)` | NULL | 稳定状态迁移原因 |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL | 创建时间 |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL | 更新时间 |
+
+```sql
+UNIQUE (review_lineage_id, fingerprint)
+INDEX (review_lineage_id, status)
+```
+
+只有非 stale 且最终 Head 校验通过的结果可以用 `review_lineages.version + latest_observed_head_sha`
+做条件更新。部分覆盖可以增加已验证问题，但不能因本轮未返回而解决旧问题；GitLab Note 发布
+失败不会回滚已经提交的账本。
 
 ### 4.6 feedbacks
 
@@ -433,9 +509,14 @@ erDiagram
     projects ||--|| project_configs : "has"
     projects ||--o{ webhook_events : "receives"
     projects ||--o{ review_jobs : "owns"
+    projects ||--o{ review_lineages : "owns"
     webhook_events ||--o{ review_jobs : "enqueues"
+    review_lineages ||--o{ review_jobs : "groups"
+    review_lineages ||--o{ lineage_finding_states : "projects current state"
     review_jobs ||--o{ outbox_events : "dispatches"
     review_jobs ||--o{ findings : "produces"
+    review_jobs ||--o{ lineage_finding_states : "advances"
+    findings ||--o{ lineage_finding_states : "latest occurrence"
     findings ||--o{ feedbacks : "receives"
     review_jobs ||--o{ llm_runs : "records"
     projects ||--o{ audit_logs : "scopes"
@@ -469,6 +550,7 @@ erDiagram
     review_jobs {
         bigint id PK
         bigint project_id FK
+        bigint review_lineage_id FK
         int mr_iid
         string head_sha
         string status
@@ -498,6 +580,28 @@ erDiagram
         string fingerprint
         string validation_status
         string validation_code
+    }
+
+    review_lineages {
+        bigint id PK
+        bigint project_id FK
+        int current_mr_iid
+        string status
+        string latest_observed_head_sha
+        string current_head_sha
+        string review_semantics_hash
+        int version
+    }
+
+    lineage_finding_states {
+        bigint id PK
+        bigint review_lineage_id FK
+        string fingerprint
+        string status
+        bigint latest_review_job_id FK
+        bigint latest_finding_id FK
+        string latest_head_sha
+        jsonb provenance
     }
 
     feedbacks {
@@ -703,6 +807,7 @@ Query：
 ```json
 {
   "id": 1001,
+  "review_lineage_id": 88,
   "project_id": 1,
   "mr_iid": 45,
   "mr_url": "https://gitlab.example.com/seakoi/design/-/merge_requests/45",
@@ -718,6 +823,20 @@ Query：
   "deletions": 30
 }
 ```
+
+#### POST `/api/reviews/{review_id}/rescan`
+
+对终态任务创建一次显式全量重扫。默认保留已证明的 ReviewLineage，但一定创建新 Review Epoch；
+`preserve_lineage=false` 用于显式切断旧账本并创建新 Lineage。
+
+```json
+{
+  "reason": "人工全量复验",
+  "preserve_lineage": true
+}
+```
+
+该接口需要 API Bearer Token。源任务未终态、项目已禁用或任务缺少可重扫上下文时拒绝创建。
 
 #### GET `/api/reviews/{review_id}/findings`
 

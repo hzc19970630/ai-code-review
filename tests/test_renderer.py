@@ -40,9 +40,10 @@ def _finding(*, validation_status: str) -> VerifiedFinding:
             scope="diff_line",
             file_path="src/app.py",
             line_start=2,
-            title="A concrete API regression was found",
-            description="The public behavior changed.",
+            title="发现明确的 API 兼容性回归",
+            description="公共行为发生了不兼容变更。",
             evidence="old = True",
+            suggestion="恢复兼容行为并补充回归测试。",
             confidence=90,
         ),
         fingerprint="fingerprint",
@@ -55,7 +56,7 @@ def test_rejected_finding_does_not_leak_model_claim_into_summary() -> None:
     findings = [_finding(validation_status="rejected")]
 
     summary = build_review_summary(
-        model_summary="A concrete API regression was found.",
+        model_summary="发现明确的 API 兼容性回归。",
         findings=findings,
         model_reviewed=True,
     )
@@ -68,7 +69,7 @@ def test_rejected_finding_does_not_leak_model_claim_into_summary() -> None:
     )
 
     assert summary == "未发现通过验证且达到发布阈值的问题。"
-    assert "A concrete API regression was found" not in markdown
+    assert "发现明确的 API 兼容性回归" not in markdown
     assert markdown.count("未发现通过验证且达到发布阈值的问题。") == 1
 
 
@@ -83,6 +84,19 @@ def test_publishable_finding_uses_deterministic_summary() -> None:
 
     assert summary == "发现 1 个通过验证且达到发布阈值的问题。"
 
+    markdown = render_review_markdown(
+        review_job_id=7,
+        head_sha="a" * 40,
+        summary=summary,
+        findings=findings,
+        context=_context(),
+    )
+    assert "## AI 代码审查结果" in markdown
+    assert "### 问题" in markdown
+    assert "**[中] 发现明确的 API 兼容性回归**" in markdown
+    assert "（变更行）" in markdown
+    assert "### 覆盖情况" in markdown
+
 
 def test_system_summary_is_preserved_when_model_was_not_called() -> None:
     summary = build_review_summary(
@@ -92,3 +106,25 @@ def test_system_summary_is_preserved_when_model_was_not_called() -> None:
     )
 
     assert summary == "本次 MR 没有可审查的受支持代码文件。"
+
+
+def test_project_profile_advisory_is_not_rendered_as_a_coverage_limit() -> None:
+    context = _context()
+    context.advisories.extend(
+        [
+            "已达到项目画像字符预算上限",
+            "项目画像使用的仓库树已截断",
+        ]
+    )
+
+    markdown = render_review_markdown(
+        review_job_id=7,
+        head_sha="a" * 40,
+        summary="未发现通过验证且达到发布阈值的问题。",
+        findings=[],
+        context=context,
+    )
+
+    assert "- 提示：已达到项目画像字符预算上限" in markdown
+    assert "- 提示：项目画像使用的仓库树已截断" in markdown
+    assert "- 限制：已达到项目画像字符预算上限" not in markdown

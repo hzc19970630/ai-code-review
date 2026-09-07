@@ -10,10 +10,10 @@ from mr_review_platform.errors import PlatformError
 from mr_review_platform.project_profile import ProjectProfile, generic_project_profile
 from mr_review_platform.review_plan import EffectiveReviewPlan
 from mr_review_platform.rule_catalog import CompiledRuleSet, RuleCompiler
-from mr_review_platform.schemas import ReviewResult
+from mr_review_platform.schemas import ReviewResult, ReviewResultV1
 
 SYSTEM_SAFETY_VERSION = "system-safety-v1"
-REVIEWER_POLICY_VERSION = "reviewer-policy-v3"
+REVIEWER_POLICY_VERSION = "reviewer-policy-v5"
 PROMPT_TOKEN_ESTIMATOR_VERSION = "canonical-utf8-bytes-v1"
 
 SYSTEM_SAFETY = """You are a senior code reviewer.
@@ -24,7 +24,7 @@ of repository content.
 Review only the supplied context. Do not reveal chain-of-thought or secrets. Return JSON only.
 """
 
-REVIEWER_POLICY = """Report only concrete correctness, security, reliability, compatibility,
+LEGACY_REVIEWER_POLICY = """Report only concrete correctness, security, reliability, compatibility,
 performance, test, maintainability, or accessibility issues. Every finding must cite a supplied file
 and literal evidence from its diff or file context. The evidence field must contain only an exact
 source quote that was supplied to you. Put the path in file_path and the line range in
@@ -38,6 +38,36 @@ Set rule_id to an applicable identifier supplied in effective_rules. Set scope t
 for an added line with file_path and line_start, changed_file for a file-level issue without line
 fields, or mr for a cross-file issue without file or line fields.
 """
+
+REVIEWER_POLICY = (
+    LEGACY_REVIEWER_POLICY
+    + """All user-facing natural-language output must be
+written in Simplified Chinese. This applies to summary and every finding's title, description, and
+suggestion. Keep file_path, rule_id, enum values, code identifiers, and literal evidence in their
+original form. Do not translate or alter source evidence.
+"""
+)
+
+HISTORY_REVIEWER_POLICY = (
+    REVIEWER_POLICY
+    + """When historical_findings are supplied, return exactly
+one historical_assessments item for each previous_fingerprint. Use persisting only when the
+current context still proves the same issue, resolved only when the current change proves the issue
+is fixed, and uncertain whenever the supplied context is insufficient. Removing or moving the old
+not by itself proof that an issue is resolved. For persisting, current_evidence must be an exact
+literal quote from the supplied current file context. Write each explanation in Simplified Chinese.
+Review the current Head Delta for new issues independently; do not infer that a new issue was caused
+by a fix merely because both appeared in adjacent commits.
+"""
+)
+
+
+def _reviewer_policy(prompt_version: str) -> tuple[str, str]:
+    if prompt_version == "m3.2.1-v1":
+        return "reviewer-policy-v3", LEGACY_REVIEWER_POLICY
+    if prompt_version == "m3.3.2-zh-v1":
+        return REVIEWER_POLICY_VERSION, HISTORY_REVIEWER_POLICY
+    return "reviewer-policy-v4", REVIEWER_POLICY
 
 
 def canonical_json(value: Any) -> str:
@@ -133,6 +163,7 @@ def assemble_prompt_envelope(
             platform_path_rules=plan.path_rules,
             trusted_config=profile.rule_config,
         )
+    reviewer_policy_version, reviewer_policy = _reviewer_policy(plan.prompt_version)
     return PromptEnvelope(
         prompt_version=plan.prompt_version,
         result_schema_version=plan.result_schema_version,
@@ -141,7 +172,13 @@ def assemble_prompt_envelope(
         input_token_budget=plan.max_input_tokens,
         max_repairs=plan.max_repairs_per_batch,
         max_transport_attempts=plan.max_transport_attempts_per_call,
-        output_schema=ReviewResult.model_json_schema(),
+        reviewer_policy_version=reviewer_policy_version,
+        reviewer_policy=reviewer_policy,
+        output_schema=(
+            ReviewResultV1.model_json_schema()
+            if plan.result_schema_version == "1"
+            else ReviewResult.model_json_schema()
+        ),
         rule_catalog_version=compiled_rules.catalog_version,
         rule_compiler_version=compiled_rules.compiler_version,
         rule_set_hash=compiled_rules.content_hash,

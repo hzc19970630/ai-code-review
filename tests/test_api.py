@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from threading import Barrier
 
 from fastapi.testclient import TestClient
@@ -8,7 +9,7 @@ from sqlalchemy import select
 
 from mr_review_platform.api import create_app
 from mr_review_platform.config import Settings
-from mr_review_platform.models import OutboxEvent, ReviewJob, WebhookEvent
+from mr_review_platform.models import OutboxEvent, ReviewJob, ReviewLineage, WebhookEvent
 from mr_review_platform.services import DEFAULT_EXTENSIONS, ProjectRegistration, register_project
 from mr_review_platform.worker import reconcile_once
 
@@ -87,6 +88,7 @@ def test_webhook_is_authenticated_durable_and_idempotent(
             outbox_events = session.scalars(select(OutboxEvent)).all()
             review_job = session.get(ReviewJob, first.json()["review_job_id"])
             assert review_job is not None
+            assert review_job.review_lineage_id is not None
             review_job.project_profile = {
                 "schema_version": "project-profile/v1",
                 "content_hash": "profile-hash",
@@ -119,6 +121,148 @@ def test_webhook_is_authenticated_durable_and_idempotent(
         assert detail.json()["review_outcome"] == "partial"
         assert detail.json()["project_profile"]["content_hash"] == "profile-hash"
         assert detail.json()["context_manifest"]["terminal_state"] == "partial"
+
+        with app.state.database.session() as session:
+            source_job = session.get(ReviewJob, first.json()["review_job_id"])
+            assert source_job is not None
+            source_job.status = "succeeded"
+            session.commit()
+        rescan = client.post(
+            f"/api/reviews/{first.json()['review_job_id']}/rescan",
+            json={"reason": "人工验收全量重扫"},
+            headers={"Authorization": "Bearer api-token"},
+        )
+        assert rescan.status_code == 202
+        assert rescan.json()["review_epoch_reset"] is True
+        with app.state.database.session() as session:
+            rescan_job = session.get(ReviewJob, rescan.json()["review_job_id"])
+            assert rescan_job is not None
+            assert rescan_job.trigger_type == "full_rescan"
+            assert rescan_job.parent_review_job_id is None
+            assert rescan_job.review_lineage_id == source_job.review_lineage_id
+            assert rescan_job.config_snapshot["review_epoch_reason"] == "人工验收全量重扫"
+
+        with app.state.database.session() as session:
+            parent = session.get(ReviewJob, first.json()["review_job_id"])
+            assert parent is not None
+            parent.status = "succeeded"
+            session.commit()
+
+        next_payload = deepcopy(gitlab_payload)
+        next_payload["object_attributes"]["last_commit"]["id"] = "b" * 40
+        next_head = client.post(
+            "/api/webhooks/gitlab",
+            json=next_payload,
+            headers={**headers, "X-Gitlab-Event-UUID": "event-next-head"},
+        )
+
+        assert next_head.status_code == 202
+        with app.state.database.session() as session:
+            child = session.get(ReviewJob, next_head.json()["review_job_id"])
+            assert child is not None
+            assert child.parent_review_job_id == first.json()["review_job_id"]
+            assert child.review_lineage_id == parent.review_lineage_id
+
+        reset_lineage = client.post(
+            f"/api/reviews/{first.json()['review_job_id']}/rescan",
+            json={"reason": "隔离重扫", "preserve_lineage": False},
+            headers={"Authorization": "Bearer api-token"},
+        )
+        assert reset_lineage.status_code == 202
+        with app.state.database.session() as session:
+            reset_job = session.get(ReviewJob, reset_lineage.json()["review_job_id"])
+            source_job = session.get(ReviewJob, first.json()["review_job_id"])
+            assert reset_job is not None
+            assert source_job is not None
+            assert reset_job.review_lineage_id != source_job.review_lineage_id
+            assert reset_job.config_snapshot["review_lineage_reset"] is True
+
+
+def test_webhook_updates_lineage_lifecycle_without_creating_terminal_jobs(
+    tmp_path, monkeypatch, gitlab_payload: dict
+) -> None:
+    monkeypatch.setenv("TEST_WEBHOOK_SECRET", "webhook-secret")
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    settings = Settings(
+        app_env="test",
+        database_url=f"sqlite:///{tmp_path / 'lineage-lifecycle.db'}",
+        queue_enabled=False,
+        auto_create_schema=True,
+    )
+    app = create_app(settings)
+    headers = {
+        "X-Gitlab-Event": "Merge Request Hook",
+        "X-Gitlab-Token": "webhook-secret",
+    }
+
+    with TestClient(app) as client:
+        with app.state.database.session() as session:
+            register_project(
+                session,
+                ProjectRegistration(
+                    provider_project_id="123",
+                    name="demo",
+                    namespace="team/demo",
+                    repository_url="https://gitlab.example.com/team/demo.git",
+                    web_url=None,
+                    default_branch="main",
+                    webhook_secret_ref="env://TEST_WEBHOOK_SECRET",
+                    git_token_ref="env://TEST_GITLAB_TOKEN",
+                    supported_extensions=[".py"],
+                ),
+            )
+
+        opened = client.post(
+            "/api/webhooks/gitlab",
+            json=gitlab_payload,
+            headers={**headers, "X-Gitlab-Event-UUID": "lineage-open"},
+        )
+        assert opened.status_code == 202
+
+        closed_payload = deepcopy(gitlab_payload)
+        closed_payload["object_attributes"]["action"] = "close"
+        closed_payload["object_attributes"]["state"] = "closed"
+        closed = client.post(
+            "/api/webhooks/gitlab",
+            json=closed_payload,
+            headers={**headers, "X-Gitlab-Event-UUID": "lineage-close"},
+        )
+        assert closed.status_code == 200
+        assert closed.json()["status"] == "ignored"
+        with app.state.database.session() as session:
+            lineage = session.scalar(select(ReviewLineage))
+            assert lineage is not None
+            assert lineage.status == "dormant"
+            assert len(session.scalars(select(ReviewJob)).all()) == 1
+
+        reopened_payload = deepcopy(gitlab_payload)
+        reopened_payload["object_attributes"]["action"] = "reopen"
+        reopened = client.post(
+            "/api/webhooks/gitlab",
+            json=reopened_payload,
+            headers={**headers, "X-Gitlab-Event-UUID": "lineage-reopen"},
+        )
+        assert reopened.status_code == 200
+        assert reopened.json()["status"] == "duplicate"
+        with app.state.database.session() as session:
+            lineage = session.scalar(select(ReviewLineage))
+            assert lineage is not None
+            assert lineage.status == "active"
+
+        merged_payload = deepcopy(gitlab_payload)
+        merged_payload["object_attributes"]["action"] = "merge"
+        merged_payload["object_attributes"]["state"] = "merged"
+        merged = client.post(
+            "/api/webhooks/gitlab",
+            json=merged_payload,
+            headers={**headers, "X-Gitlab-Event-UUID": "lineage-merge"},
+        )
+        assert merged.status_code == 200
+        with app.state.database.session() as session:
+            lineage = session.scalar(select(ReviewLineage))
+            assert lineage is not None
+            assert lineage.status == "completed"
+            assert len(session.scalars(select(ReviewJob)).all()) == 1
 
 
 def test_webhook_rejects_wrong_secret(tmp_path, monkeypatch, gitlab_payload: dict) -> None:

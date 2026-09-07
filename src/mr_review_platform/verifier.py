@@ -4,7 +4,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 
-from mr_review_platform.context import ContextPack, diff_added_line_map
+from mr_review_platform.context import ChangeContext, ContextPack, diff_added_line_map
 from mr_review_platform.rule_catalog import CompiledRuleSet
 from mr_review_platform.schemas import FindingDraft, ReviewResult
 
@@ -48,6 +48,8 @@ class VerifiedFinding:
     validation_message: str | None
     validation_code: str | None = None
     source_pass: str = "review"
+    origin_scope: str = "cumulative"
+    publication_status: str = "published"
 
 
 def merge_verified_findings(
@@ -88,7 +90,18 @@ def aggregate_verified_findings(
     findings: list[VerifiedFinding],
 ) -> list[VerifiedFinding]:
     deterministic = [item for item in findings if item.source_pass.startswith("syntax:")]
-    model_findings = [item for item in findings if not item.source_pass.startswith("syntax:")]
+    carried = [item for item in findings if item.source_pass == "carry-forward"]
+    carried_fingerprints = {item.fingerprint for item in carried}
+    model_findings = [
+        *carried,
+        *(
+            item
+            for item in findings
+            if not item.source_pass.startswith("syntax:")
+            and item.source_pass != "carry-forward"
+            and item.fingerprint not in carried_fingerprints
+        ),
+    ]
     merged = merge_verified_findings(deterministic, model_findings)
     return sorted(
         merged,
@@ -253,19 +266,21 @@ def verify_review_result_v2(
     min_confidence: int,
     compiled_rules: CompiledRuleSet | None = None,
 ) -> list[VerifiedFinding]:
-    changes = {change.path: change for change in context.changes}
+    changes_by_path: dict[str, list[ChangeContext]] = {}
+    for change in context.changes:
+        changes_by_path.setdefault(change.path, []).append(change)
     seen: set[str] = set()
     verified: list[VerifiedFinding] = []
 
     for finding in result.findings:
         validation_code: str | None = None
-        change = changes.get(finding.file_path or "")
+        changes = changes_by_path.get(finding.file_path or "", [])
         normalized_evidence, evidence_code = normalize_evidence_v2(finding)
 
         validation_code = _rule_validation_code(finding, compiled_rules)
         if validation_code is None and not _scope_is_valid(finding):
             validation_code = SCOPE_INVALID
-        elif validation_code is None and finding.scope != "mr" and change is None:
+        elif validation_code is None and finding.scope != "mr" and not changes:
             validation_code = FILE_NOT_IN_CONTEXT
         elif validation_code is None and finding.confidence < min_confidence:
             validation_code = CONFIDENCE_BELOW_THRESHOLD
@@ -274,15 +289,33 @@ def verify_review_result_v2(
             validation_code = evidence_code
             if validation_code is None and normalized_evidence not in target_source:
                 validation_code = EVIDENCE_NOT_LITERAL
-        elif validation_code is None and change is not None:
-            added_line_map = change.added_line_map or diff_added_line_map(change.diff)
+        elif validation_code is None and changes:
             if finding.scope == "diff_line":
-                target_source = _line_source(finding, added_line_map)
-                if change.change_type == "deleted" or target_source is None:
+                target_source = next(
+                    (
+                        source
+                        for change in changes
+                        if change.change_type != "deleted"
+                        and (
+                            source := _line_source(
+                                finding,
+                                change.added_line_map or diff_added_line_map(change.diff),
+                            )
+                        )
+                        is not None
+                    ),
+                    None,
+                )
+                if target_source is None:
                     validation_code = LINE_NOT_IN_DIFF
             else:
                 target_source = "\n".join(
-                    [_diff_source_text(change.diff), _snippet_source_text(change.snippet)]
+                    source
+                    for change in changes
+                    for source in (
+                        _diff_source_text(change.diff),
+                        _snippet_source_text(change.snippet),
+                    )
                 )
 
             if validation_code is None:

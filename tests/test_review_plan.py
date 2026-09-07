@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import pytest
 
+from mr_review_platform.project_profile import ProjectProfile, TrustedReviewScopeConfig
 from mr_review_platform.review_plan import (
     ReviewPlanError,
+    apply_repository_scope_overrides,
     build_effective_review_plan,
     load_effective_review_plan,
 )
@@ -52,9 +54,10 @@ def test_effective_review_plan_hash_is_canonical_and_stable() -> None:
     assert first.plan_hash == second.plan_hash
     assert len(first.plan_hash) == 64
     assert first.supported_extensions == (".py", ".ts")
-    assert first.plan_version == "m3.3-v1"
-    assert first.prompt_version == "m3.2.1-v1"
-    assert first.verifier_version == "syntax-priority-v4"
+    assert first.plan_version == "m3.3.3-v1"
+    assert first.prompt_version == "m3.3.2-zh-v1"
+    assert first.verifier_version == "convergence-aware-v7"
+    assert first.result_schema_version == "2"
     assert len(first.project_profile.policy_hash) == 64
     assert first.rule_catalog_version == "rule-catalog/v1"
     assert first.rule_compiler_version == "rule-compiler/v1"
@@ -97,6 +100,32 @@ def test_review_plan_change_produces_a_new_hash() -> None:
     second = build_effective_review_plan({**_snapshot(), "config_version": 4})
 
     assert first.plan_hash != second.plan_hash
+
+
+def test_repository_scope_overrides_platform_file_defaults() -> None:
+    platform_plan = build_effective_review_plan(_snapshot())
+    profile = ProjectProfile(
+        source_ref="b" * 40,
+        workspace_roots=(".",),
+        review_scope=TrustedReviewScopeConfig(
+            supported_extensions=(".tsx",),
+            ignore_paths=("generated/**",),
+        ),
+        total_chars=0,
+    )
+
+    resolved = apply_repository_scope_overrides(platform_plan, profile)
+
+    assert resolved.supported_extensions == (".tsx",)
+    assert resolved.ignore_paths == ("generated/**",)
+    assert resolved.plan_hash != platform_plan.plan_hash
+
+
+def test_repository_scope_omissions_inherit_platform_defaults() -> None:
+    platform_plan = build_effective_review_plan(_snapshot())
+    profile = ProjectProfile(source_ref="b" * 40, workspace_roots=(".",), total_chars=0)
+
+    assert apply_repository_scope_overrides(platform_plan, profile) is platform_plan
 
 
 def test_legacy_plan_is_not_silently_upgraded() -> None:

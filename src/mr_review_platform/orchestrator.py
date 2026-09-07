@@ -50,6 +50,7 @@ class ReviewOrchestrator:
         context: ContextPack,
         plan: EffectiveReviewPlan,
         project_profile: ProjectProfile | None = None,
+        project_profile_prompt: dict | None = None,
     ) -> OrchestratedReview:
         profile = project_profile or generic_project_profile(head_sha)
         compiled_rules = context.compiled_rule_set or RuleCompiler().compile(
@@ -60,8 +61,12 @@ class ReviewOrchestrator:
             trusted_config=profile.rule_config,
         )
         for limitation in profile.coverage_limitations():
-            if limitation not in context.limitations:
-                context.limitations.append(limitation)
+            if limitation not in context.advisories:
+                context.advisories.append(limitation)
+        if context.manifest is not None:
+            context.manifest = context.manifest.model_copy(
+                update={"advisories": tuple(sorted(set(context.advisories)))}
+            )
 
         llm_output: LLMReviewOutput | None = None
         envelope: PromptEnvelope | None = None
@@ -81,12 +86,12 @@ class ReviewOrchestrator:
                 coverage=Coverage(
                     reviewed_files=0,
                     skipped_files=len(context.changes) + len(context.skipped_files),
-                    limitations=[*context.limitations, "project data policy is metadata_only"],
+                    limitations=[*context.limitations, "项目数据策略为 metadata_only"],
                 ),
                 findings=[],
             )
         elif self._model is None:
-            limitation = "LLM semantic review is disabled; deterministic analysis only"
+            limitation = "LLM 语义评审已禁用，仅执行确定性分析"
             if limitation not in context.limitations:
                 context.limitations.append(limitation)
             result = ReviewResult(
@@ -102,7 +107,9 @@ class ReviewOrchestrator:
             envelope = assemble_prompt_envelope(
                 plan,
                 context.to_prompt(),
-                project_profile=profile.to_prompt(),
+                project_profile=project_profile_prompt
+                or context.profile_slice
+                or profile.to_prompt(),
                 compiled_rules=compiled_rules,
                 deterministic_syntax_files=tuple(
                     path
@@ -131,13 +138,16 @@ class ReviewOrchestrator:
         ):
             result = result.model_copy(
                 update={
-                    "summary": ("评审未完整完成：部分文件的确定性语法分析失败，请查看 Coverage。")
+                    "summary": ("评审未完整完成：部分文件的确定性语法分析失败，请查看覆盖情况。")
                 }
             )
         summary = build_review_summary(
             model_summary=result.summary,
             findings=verified,
             model_reviewed=llm_output is not None,
+            context_limited=bool(
+                context.manifest and context.manifest.context_sufficiency == "limited"
+            ),
         )
         markdown = render_review_markdown(
             review_job_id=review_job_id,
@@ -176,17 +186,19 @@ def build_syntax_findings(
     context: ContextPack,
     profile: ProjectProfile,
 ) -> list[VerifiedFinding]:
-    changes = {change.path: change for change in context.changes}
+    added_lines_by_path: dict[str, set[int]] = {}
+    for change in context.changes:
+        added_lines_by_path.setdefault(change.path, set()).update(change.added_lines)
     verified: list[VerifiedFinding] = []
     for path, analysis in sorted(context.syntax_results.items()):
-        change = changes.get(path)
-        if change is None:
+        added_lines = added_lines_by_path.get(path)
+        if added_lines is None:
             continue
         for item in analysis.to_findings(in_build_scope=_path_is_in_build_scope(path, profile)):
-            on_added_line = item.line_start in change.added_lines
+            on_added_line = item.line_start in added_lines
             description = item.description
             if not on_added_line:
-                description = f"Parser location: line {item.line_start}. {item.description}"
+                description = f"解析器定位在第 {item.line_start} 行。{item.description}"
             draft = FindingDraft(
                 severity=item.severity,
                 category=item.category,

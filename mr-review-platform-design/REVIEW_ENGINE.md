@@ -62,6 +62,7 @@ Review Engine 将 GitLab MR 变更转换为经过验证的结构化 Finding。�
 - `new_file_content` 或选取后的片段
 - `old_file_content`，仅在兼容性分析需要时提供
 - GitLab 返回的 `collapsed/too_large/binary` 标志
+- `segment_id/segment_index/segment_count/new_line_start/new_line_end`
 
 不能像旧实现一样直接丢弃删除文件。删除和重命名通常是 API 兼容性、配置和导出问题的重要信号。
 
@@ -91,8 +92,10 @@ Review Engine 将 GitLab MR 变更转换为经过验证的结构化 Finding。�
 
 1. 去掉未命中的低优先级相关文件
 2. 仅保留变更符号附近片段
-3. 按文件或模块分批审查
+3. 按文件或模块分批审查；单文件超长 Diff 先按 hunk/行边界形成稳定 Segment，并允许跨批
 4. 对 `too_large` MR 标记部分覆盖，而不是静默截断
+
+禁止在 Batch Planner 前按固定字符数保留 Diff 前缀。文件只有在全部 Segment 批次成功后才进入 `reviewed_files`；部分成功必须记录为 `incomplete_files + partially_reviewed_files`，并保留未完成 Segment 的新侧行范围和 reason code。确定性语法分析使用完整 Head 文件且每路径只执行一次，Verifier 则合并同一路径全部已评审 Segment 的新增行映射。
 
 ### 4.3 风险提示
 
@@ -106,6 +109,22 @@ Context Builder 使用确定性规则生成风险提示，例如：
 - 锁文件、生成文件和二进制文件
 
 风险提示用于选择规则和预算，不直接生成 Finding。
+
+### 4.4 连续 Head 与双维覆盖
+
+- 新 Head 通过 `parent_review_job_id` 指向同一 ReviewLineage 最近一个成功任务，并用 GitLab Compare 标识本次 Head Delta；当前已实现同 MR，M3.3.4 扩展到严格验证后的重建 MR。
+- 历史有效 Finding 的主文件、Rule Hash 和实际关联依赖均未变化时直接以 `carry-forward` 延续；任一依赖变化时进入定向复核。
+- 定向复核只允许 `persisting | resolved | uncertain`；Evidence 消失、模型漏回传或上下文不足不能自动判定 resolved。
+- Batch 使用 ProfileSlice，只注入当前路径需要的框架事实、规范、入口和来源哈希；Slice Hash 进入 Batch 身份。
+- `workset_coverage` 只回答代码工作集是否完成；`context_sufficiency` 单独披露必要 companion、直接依赖或历史依赖是否充分。
+
+### 4.5 ReviewLineage 账本输入边界
+
+- Review Engine 只消费已经由应用层确认的 `review_lineage_id` 和上一有效状态，不自行搜索相似 MR 或猜测谱系。
+- 相同 Head 的重建 MR 可以直接消费账本中 `open` Finding；后继 Head 必须同时提供 Compare Delta 和旧 Provenance。
+- 不完整评审、失败任务或 stale Head 不得把“模型未返回”转换为 resolved。
+- 两个独立 Lineage 即使修改相同路径和相同行，也分别评审、分别保存状态，不能共享 Transition。
+- 仓库级相似问题关联不进入 ContextPack、Prompt、Verifier 或发布决策。
 
 ## 5. 规则系统
 
@@ -252,6 +271,22 @@ project_id + normalized_file_path + rule_id/category + normalized_title + code_a
 ```
 
 `code_anchor` 使用相关代码片段归一化哈希，不直接使用绝对行号，以减少同一问题因代码移动产生重复 Finding。
+
+Fingerprint 表示问题证据身份，不表示全局生命周期身份。持久化去重范围必须显式区分：
+
+- 单次发生记录：`review_job_id + fingerprint`。
+- 谱系当前状态：`review_lineage_id + fingerprint`。
+- 不同 ReviewLineage 中相同 Fingerprint 允许并存，不能自动合并或互相解决。
+
+### 9.1 当前状态投影
+
+M3.3.4 引入的 `LineageFindingState` 只保存经过 Verifier 的当前状态：
+
+```text
+open | resolved | uncertain | not_applicable
+```
+
+每次评审完整、非 stale 且最终 Head 校验通过的任务先生成不可变 Finding Occurrence 和 Transition，再以 Lineage 当前 Head/版本做条件更新。部分评审可追加已验证的新 Finding，但不能解决未覆盖文件上的旧问题。未变化 Provenance 可确定性保持 `open`；变化项必须定向复核。GitLab Note 从当前投影渲染，但 Note 删除、MR 关闭或 LLM 漏报都不能直接改变账本状态。
 
 ## 10. 确定性语法分析
 

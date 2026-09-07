@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 DATASET_SCHEMA_VERSION = "seed-dataset/v1"
 PREDICTIONS_SCHEMA_VERSION = "evaluation-predictions/v1"
 REPORT_SCHEMA_VERSION = "evaluation-report/v1"
+CONVERGENCE_SEQUENCE_SCHEMA_VERSION = "convergence-sequence/v1"
+CONVERGENCE_REPORT_SCHEMA_VERSION = "convergence-report/v1"
 
 
 class EvaluationFinding(BaseModel):
@@ -117,12 +119,68 @@ class EvaluationReport(BaseModel):
     unknown_prediction_cases: tuple[str, ...]
 
 
+class ConvergenceFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    fingerprint: str = Field(min_length=1, max_length=128)
+    origin_scope: Literal["historical", "head_delta", "impact_scope", "cumulative"]
+    publication_status: Literal[
+        "published", "shadow_candidate", "threshold_suppressed", "rejected"
+    ]
+
+
+class ConvergenceTransition(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    previous_fingerprint: str = Field(min_length=1, max_length=128)
+    state: Literal["persisting", "resolved", "uncertain", "not_applicable"]
+
+
+class ConvergenceHead(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    review_job_id: int = Field(ge=1)
+    head_sha: str = Field(min_length=7, max_length=64)
+    change_kind: Literal["baseline", "fix_only", "fix_with_regression", "no_op"]
+    workset_coverage: Literal["full", "partial", "none"]
+    context_sufficiency: Literal["sufficient", "limited"]
+    previous_open_fingerprints: tuple[str, ...] = ()
+    transitions: tuple[ConvergenceTransition, ...] = ()
+    findings: tuple[ConvergenceFinding, ...] = ()
+
+
+class ConvergenceSequence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["convergence-sequence/v1"] = CONVERGENCE_SEQUENCE_SCHEMA_VERSION
+    sequence_id: str = Field(min_length=1, max_length=128)
+    heads: tuple[ConvergenceHead, ...] = Field(min_length=2)
+
+
+class ConvergenceReport(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["convergence-report/v1"] = CONVERGENCE_REPORT_SCHEMA_VERSION
+    sequence_id: str
+    evaluated_heads: int
+    complete_heads: int
+    missing_transitions: int
+    out_of_delta_published: int
+    unexpected_fix_only_findings: int
+    unexpected_no_op_findings: int
+    passed: bool
+
+
 def load_seed_dataset(path: str | Path) -> SeedDataset:
     return SeedDataset.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
 def load_predictions(path: str | Path) -> EvaluationPredictions:
     return EvaluationPredictions.model_validate_json(Path(path).read_text(encoding="utf-8"))
+
+
+def load_convergence_sequence(path: str | Path) -> ConvergenceSequence:
+    return ConvergenceSequence.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
 def _line_matches(expected: EvaluationFinding, actual: EvaluationFinding) -> bool:
@@ -213,6 +271,53 @@ def evaluate_dataset(
         clean_zero_noise_rate=(clean_zero_noise_cases / clean_cases if clean_cases else None),
         missing_prediction_cases=tuple(missing),
         unknown_prediction_cases=tuple(unknown),
+    )
+
+
+def evaluate_convergence(sequence: ConvergenceSequence) -> ConvergenceReport:
+    missing_transitions = 0
+    out_of_delta_published = 0
+    unexpected_fix_only_findings = 0
+    unexpected_no_op_findings = 0
+    complete_heads = 0
+
+    for head in sequence.heads:
+        if head.workset_coverage == "full" and head.context_sufficiency == "sufficient":
+            complete_heads += 1
+        transitioned = {item.previous_fingerprint for item in head.transitions}
+        missing_transitions += len(set(head.previous_open_fingerprints) - transitioned)
+        newly_published = [
+            item
+            for item in head.findings
+            if item.publication_status == "published" and item.origin_scope != "historical"
+        ]
+        if head.change_kind != "baseline":
+            out_of_delta_published += sum(
+                item.origin_scope == "cumulative" for item in newly_published
+            )
+        if head.change_kind == "fix_only":
+            unexpected_fix_only_findings += len(newly_published)
+        if head.change_kind == "no_op":
+            unexpected_no_op_findings += len(newly_published)
+
+    passed = all(
+        value == 0
+        for value in (
+            missing_transitions,
+            out_of_delta_published,
+            unexpected_fix_only_findings,
+            unexpected_no_op_findings,
+        )
+    ) and complete_heads == len(sequence.heads)
+    return ConvergenceReport(
+        sequence_id=sequence.sequence_id,
+        evaluated_heads=len(sequence.heads),
+        complete_heads=complete_heads,
+        missing_transitions=missing_transitions,
+        out_of_delta_published=out_of_delta_published,
+        unexpected_fix_only_findings=unexpected_fix_only_findings,
+        unexpected_no_op_findings=unexpected_no_op_findings,
+        passed=passed,
     )
 
 

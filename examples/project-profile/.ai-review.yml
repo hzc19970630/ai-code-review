@@ -1,5 +1,26 @@
 version: 1
 
+# Optional repository scope overrides. Omitted fields inherit platform defaults;
+# a present field replaces that platform list for reviews using this target ref.
+supported_extensions:
+  - .ts
+  - .tsx
+  - .js
+  - .jsx
+  - .json
+  - .yml
+  - .yaml
+
+ignore_paths:
+  - node_modules/**
+  - "**/node_modules/**"
+  - dist/**
+  - "**/dist/**"
+  - build/**
+  - "**/build/**"
+  - pnpm-lock.yaml
+  - "**/pnpm-lock.yaml"
+
 profile:
   source_dirs:
     - src

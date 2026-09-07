@@ -36,6 +36,7 @@ MVP 不包含：
 | 文档 | 内容 | 主要读者 |
 |---|---|---|
 | [MASTER_PLAN.md](./MASTER_PLAN.md) | 当前实现基线、目标架构、里程碑功能与验收门槛 | 负责人、架构师、研发、测试、运维 |
+| [IMPLEMENTATION_PROGRESS.md](./IMPLEMENTATION_PROGRESS.md) | 当前实施进度、验证证据、缺口和下一阶段发布门禁 | 负责人、产品、研发、测试、运维 |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 系统边界、模块划分、核心流程和技术选型 | 架构师、后端、运维 |
 | [DATABASE_API.md](./DATABASE_API.md) | 数据模型、状态机、数据库约束和 API 契约 | 后端、前端、测试 |
 | [REVIEW_ENGINE.md](./REVIEW_ENGINE.md) | ContextPack、Review Schema、Verifier 和质量策略 | AI 应用、后端、测试 |

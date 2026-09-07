@@ -2,7 +2,7 @@
 
 > 文档定位：项目设计、当前事实和建设计划的主入口。
 >
-> 状态基线：2026-08-06，以当前仓库代码、数据库迁移和自动化测试为准。
+> 状态基线：2026-08-21，以当前仓库代码、数据库迁移和自动化测试为准。
 >
 > 状态定义：`功能已实现` 表示已有代码和自动化测试支撑；`系统验收待补` 表示尚未通过对应真实依赖或现场环境验证；`规划中` 表示尚无可运行实现。
 
@@ -12,7 +12,7 @@
 
 项目当前处于：
 
-**M0 至 M2 功能实现完成，M2 隔离依赖和故障矩阵验收已通过；M3.0 至 M3.3 的代码与自动化门禁已完成。M3 尚未整体完成：M3.0.1 真实 Shadow 复验、种子样本人工裁决、50 个 Golden MR、两个真实项目 Shadow 和质量阈值验收仍待补，测试项目在完成这些门禁前继续保持 shadow。**
+**M0 至 M2 功能实现完成，M2 隔离依赖和故障矩阵验收已通过；M3.0 至 M3.3.4 的代码与自动化门禁已完成。M3.3.4 已实现 ReviewLineage、当前问题状态账本及关闭旧 MR 后重建新 MR 的受控问题接续。M3 尚未整体完成：M3.3.4 真实重建 MR、真实连续 Head/大 MR 现场复验、种子样本人工裁决、50 个 Golden MR、两个真实项目 Shadow 和质量阈值验收仍待补；受控人工验收可以临时 publish，但在完成门禁前不得扩大 publish 范围。**
 
 现有系统已经能够：
 
@@ -32,6 +32,7 @@
 - 哪些规则对哪些文件生效，是否可解释、可复现、可回滚。
 - Prompt 或模型变化后，质量是提升还是退化。
 - 大 MR 是否完整覆盖，部分失败是否会被误报为成功。
+- 同一 MR 连续提交时，未修复问题是否会因模型漂移消失，修复代码引入的新问题是否会进入评审。
 - 真实 Redis、PostgreSQL、GitLab 和进程崩溃下是否仍不丢任务、不重复评论。
 
 因此后续顺序确定为：
@@ -79,6 +80,22 @@
 - MVP 不将 AI 结果作为强制合并门禁。
 - 暂不执行仓库任意脚本，不提供无隔离的 Agent 自主执行。
 - 暂不建设向量数据库、全仓 RAG、通用 Symbol Graph 或多 Agent 编排。
+- 不替代 GitLab Issue、Jira、SAST 或缺陷管理平台，不承诺维护仓库级“全部缺陷真相”。
+- 不按文件路径、行号或相似标题自动合并不同开发者、不同变更意图或不同评审谱系的问题生命周期。
+
+### 2.5 持续问题治理职责
+
+平台必须保证“已经验证的问题不会仅因 LLM 漂移或 MR 窗口重建而消失”，但治理范围限定在同一 `ReviewLineage`：
+
+| 平台负责 | 平台不负责 |
+|---|---|
+| 保存每个 ReviewJob 的不可变 Finding 发生记录 | 建立全仓库通用缺陷台账 |
+| 维护同一评审谱系内问题的当前状态和 Evidence | 把不同谱系的相似问题自动视为同一问题 |
+| 根据 Head、规则和内容 Provenance 判定延续或定向复核 | 仅凭文件路径、行号、分支名或语义相似度继承 |
+| 将当前开放问题投影到活动 MR Note 并随 Head 更新 | 替代 Issue/Jira 的指派、排期、SLA 和跨团队处置流程 |
+| 保留完整 Coverage、Transition 和来源审计 | 将不完整评审或模型漏报解释为问题已解决 |
+
+MR 是开发者查看和处理问题的活动窗口，不是问题状态的唯一数据源。旧 MR 关闭后其 Note 冻结为历史快照；只有新 MR 被安全地关联到原 `ReviewLineage` 时，当前开放问题才投影到新 MR。仓库级相似问题统计属于后期只读关联能力，不参与自动继承、自动解决或发布。
 
 ## 3. 当前架构与演进判断
 
@@ -170,7 +187,7 @@ flowchart LR
 
 ### 4.2 当前数据模型
 
-当前共有 7 张业务表，不包含 Alembic 版本表：
+当前共有 9 张业务表，不包含 Alembic 版本表：
 
 | 表 | 作用 | 主要关系 |
 |---|---|---|
@@ -181,8 +198,19 @@ flowchart LR
 | `outbox_events` | 可靠投递事件 | N:1 关联 ReviewJob |
 | `findings` | 结构化问题和稳定指纹 | N:1 关联 ReviewJob |
 | `llm_runs` | 模型、请求哈希、耗时、Token 和错误 | N:1 关联 ReviewJob |
+| `review_lineages` | 可证明连续的一次变更谱系 | N:1 关联项目，1:N 关联 ReviewJob |
+| `lineage_finding_states` | 谱系内已验证问题的当前投影 | N:1 关联 ReviewLineage；指向首次/最近任务和最近 Finding |
 
 M3.0 已在 `review_jobs.effective_plan` 保存不可变 EffectiveReviewPlan，并用 `plan_hash` 校验内容；`config_snapshot` 保留为原始配置审计。当前不建立 Prompt/Rule Registry 数据库表，只有管理界面和独立批次恢复成为真实需求时，才增加相应表。
+
+M3.3.4 已在原有 7 张业务表基础上增加两个最小状态表，并为 `review_jobs` 增加可空 `review_lineage_id`：
+
+| 目标表 | 作用 | 唯一性与边界 |
+|---|---|---|
+| `review_lineages` | 标识可跨 MR 延续的一次代码变更意图 | 属于单一 Project；不能只由分支名决定 |
+| `lineage_finding_states` | 保存谱系内已验证问题的当前投影 | `review_lineage_id + fingerprint` 唯一；文件位置只是 Evidence 属性 |
+
+`findings` 继续保存每次 ReviewJob 的不可变 Occurrence，不被账本覆盖或改写。`lineage_finding_states` 只保存 `open | resolved | uncertain | not_applicable` 当前状态、首次/最近来源 Job、最近验证 Head 和必要的规则/Evidence/Provenance，不复制完整模型响应；评论发布状态继续归 ReviewJob。两张表不组成通用事件溯源或仓库级缺陷管理系统。
 
 ## 5. 当前实现盘点
 
@@ -246,6 +274,8 @@ M3.0 已在 `review_jobs.effective_plan` 保存不可变 EffectiveReviewPlan，�
 | Prompt 版本 | M3.0 已使用版本化 Prompt Envelope 和完整请求哈希 | 尚无 Prompt Catalog 发布、回滚和离线质量门禁 |
 | 规则 | M3.2 已执行版本化 Catalog、路径规则、可信仓库覆盖和 Verifier `rule_id/scope` 校验 | 尚无 50 个已裁决 MR 的跨项目质量证据 |
 | 项目理解 | M3.1 已从目标分支构建 ProjectProfile 并选择相关文件 | 真实项目配置效果和框架范式识别仍需 Shadow 人工验收 |
+| 跨 Head 一致性 | 每个新 Head 会重新审查累计 MR，但尚未消费上一成功 Head 的有效 Finding | 未修改问题可能因模型输出漂移在新评论中消失；修复增量缺少独立标识和定向复核 |
+| 上下文充分度 | 已统计 eligible、reviewed、incomplete 和策略排除文件 | ProjectProfile 字符预算或 Tree 截断仍可能与代码覆盖混在同一提示中，零 Finding 结论容易被误读为完整证明 |
 | Head 校验 | LLM 前和发布前各校验一次 | GitLab Staging 的快速连续 Push 契约仍需现场验证 |
 | Note 生命周期 | Marker 包含 Job 和 Head，每个新 Head 默认产生新 Note | 连续 Push 可能造成 MR 评论噪声 |
 | Token 预算 | 使用字符数除以 4 的估算 | 不同模型偏差较大，只能作为保守预算 |
@@ -262,9 +292,11 @@ M3.0 已在 `review_jobs.effective_plan` 保存不可变 EffectiveReviewPlan，�
 - 多 Dispatcher、多 Worker 和进程崩溃点。
 - GitLab Note POST 成功后超时的 Mock 契约；GitLab Staging 的分页、限流、CA 和真实网络契约仍待现场验证。
 
-M3.0 至 M3.3 自动化测试还覆盖了配置冻结、Plan/Prompt Hash 稳定性、Prompt Injection 信任边界、ProjectProfile、规则编译、确定性语法分析、GitLab overflow 分页、稳定 Batch Key、完整 eligible workset、Repair/重试预算、逐次 LLMRun 审计、中间批次失败继续、跨批聚合和一次性保存/发布。当前常规门禁为 154 passed、10 skipped；隔离 PostgreSQL 16/Redis 7 门禁为 10 passed。
+M3.0 至 M3.3.2 自动化测试还覆盖了配置冻结、Plan/Prompt Hash 稳定性、Prompt Injection 信任边界、ProjectProfile、仓库文件范围覆盖、中文输出与 Repair、规则编译、确定性语法分析、GitLab overflow 分页、稳定 Batch/Segment Key、完整 eligible workset、超长 Diff hunk 分段、Repair/重试预算、逐次 LLMRun 审计、中间批次失败继续、跨批聚合、跨 Head 父任务谱系、Compare Delta、历史 Finding 延续/解决/无法确认、ProfileSlice 和双维 Coverage。测试数量以每次全量门禁输出为准；隔离 PostgreSQL 16/Redis 7 历史门禁为 10 passed。
 
 真实 GitLab Shadow 已用一个含受支持代码的 MR 验证 Webhook、GitLab 拉取、LLM、Finding 持久化和零 Writer 调用，并发现过 Evidence 包装误拒绝。M3.0.1 已用 Evidence v2、稳定拒绝码和 MR `!32` Fixture 修复该问题，真实 Shadow 复验仍待人工触发。M3.1 已提供 12 个 synthetic `pending_human` 种子样本和评测 CLI，但它们尚未构成 Golden Dataset。仍未覆盖：按语言质量回归、多项目 Shadow 样本和企业网络完整现场契约。
+
+真实同一 MR 连续 Head 还发现：上一 Head 的两个 valid Finding 所在文件在新 Head 中内容哈希未变化，新任务也完整执行了两个 Batch，但模型没有再次输出原问题，最终评论显示零 Finding。这一事实已转化为 M3.3.2 自动化回归；代码会确定性延续内容、规则和关联依赖均未变化的问题，变化项必须定向复核。真实连续 Head Shadow 尚未完成，因此暂不扩大 publish 范围。
 
 因此 M0 至 M2 的准确状态是“功能实现完成；M2 隔离依赖验收通过，M1 的企业 GitLab Staging 现场验收和 M0 发布治理仍待补”。
 
@@ -275,7 +307,7 @@ M3.0 至 M3.3 自动化测试还覆盖了配置冻结、Plan/Prompt Hash 稳定�
 | M0 私有化运行基线 | 功能已实现，治理待补 | 统一运行时、存储、部署和配置 | CI、许可证、内部 CA 和发布治理在试点前补齐 |
 | M1 最小评审闭环 | 功能已实现，系统验收待补 | Webhook 到 GitLab 评论可用 | 真实 GitLab Staging 契约通过 |
 | M2 可靠投递与幂等 | 功能已实现，隔离依赖验收通过 | 至少一次投递下不丢任务、不重复业务结果 | PostgreSQL/Redis/崩溃矩阵已通过；生产容量和现场网络仍需验证 |
-| M3 项目理解和质量基线 | M3.0 至 M3.3 代码和自动化完成，质量验收待补 | 可复现计划、项目画像、规则 Prompt、大 MR 和评测 | 两个试点生态通过离线及 Shadow 门禁 |
+| M3 项目理解和质量基线 | M3.0 至 M3.3.4 代码和自动化完成；系统验收待补 | 可复现计划、项目画像、规则 Prompt、大 MR、跨 Head/重建 MR 一致性和评测 | 谱系账本及连续 Head 真实 Shadow 通过，两个试点生态通过离线及 Shadow 门禁 |
 | M4 可观测试点 | 规划中 | 真实项目持续运行且可诊断、可度量 | 至少 14 天和 100 个 eligible 事件 |
 | M5 反馈与企业治理 | 规划中 | 多项目运营、权限、审计和配置治理 | 权限、反馈、备份和升级验收通过 |
 | M6 高级评审 | 条件规划 | 行级评论、跨文件索引、Agent 和门禁 | 由质量和成本数据单独立项 |
@@ -352,7 +384,7 @@ docker compose -f docker-compose.m2.yml down
 
 ### M3 项目理解、规则 Prompt 和质量基线
 
-M3 保持模块化单体，参考 3 个两周迭代。评测从第一天开始，不等所有功能完成后再补。
+M3 保持模块化单体。原功能迭代已经完成至 M3.3.1，M3.3.2 是真实连续 Head 回归暴露后的 P1 补充包；评测与实现并行推进，不等所有功能完成后再补。
 
 #### M3.0 安全、可复现和评测起点
 
@@ -434,7 +466,7 @@ Verifier 判定顺序：
 
 #### M3.1 最小 ProjectProfile 和 ContextManifest
 
-当前状态：代码和自动化门禁已完成。已覆盖 4 类项目 Fixture、目标分支信任边界、有界 Tree 扫描、配置声明路径精确读取、Profile/Prompt 总预算、同路径多来源身份、Head 漂移、失败任务 Manifest 持久化、Profile 冻结哈希、Coverage partial 和 API 持久化；常规测试与隔离 PostgreSQL/Redis 故障套件通过。真实项目配置效果和 Coverage 文案仍需 Shadow 人工验收。
+当前状态：代码和自动化门禁已完成。已覆盖 4 类项目 Fixture、目标分支信任边界、有界 Tree 扫描、配置声明路径精确读取、平台文件范围默认值与仓库覆盖、Profile/Prompt 总预算、同路径多来源身份、Head 漂移、失败任务 Manifest 持久化、Profile 冻结哈希、Coverage partial 和 API 持久化；常规测试与隔离 PostgreSQL/Redis 故障套件通过。范围覆盖效果、中文 Note 和真实项目 Coverage 仍需 Shadow 人工验收。
 
 目标不是建立全仓索引，而是给模型一份小而可信、可追溯的项目画像。
 
@@ -463,7 +495,15 @@ Verifier 判定顺序：
 5. 精确读取和 Tree 推断共用硬预算：ProjectProfile 最多尝试 24 个文件、单文件最多 8,000 字符、单个规范最多使用 4,000 字符、总画像最多 16,000 字符；显式配置和规范优先于可选推断文件。关联上下文继续受最多 8 个文件和 Context/Batch Token 预算限制。
 6. M3 继续使用 GitLab API 和 ReviewJob 进程内短期文件缓存，不执行 `git clone`，不持久化 Git 仓库，不新增仓库缓存卷、清理任务或项目级 Git 锁。只有真实数据证明 API 路径发现不足且 M3 质量门禁完成后，才评估 `--filter=blob:none` 的本地 Git 索引方案。
 
-仓库配置使用严格白名单 Schema，完整模板见 `examples/project-profile/.ai-review.yml`。当前仅允许 `source_dirs`、`test_dirs`、`generated_dirs`、`key_paths`、`standards` 和 `companion_patterns`；不允许项目提供 System Prompt、Parser 命令、模型端点或发布策略。
+预算和 Coverage 语义必须分开：
+
+- `PROFILE_TREE_TRUNCATED` 只表示自动发现样本不完整，不等于变更文件未审查；`.ai-review.yml`、变更文件和显式声明路径仍按精确路径读取。
+- `PROFILE_TOTAL_BUDGET` 只表示画像候选没有全部进入结构化画像，不应单独把 eligible 文件 Coverage 降为 partial。只有当前批次所需的规范或关联文件没有取得时，才降低上下文充分度。
+- M3.3.2 将 Coverage 拆成 `workset_coverage` 和 `context_sufficiency`。前者回答“代码是否进入并成功完成评审”，后者回答“得出语义结论所需的项目规范和关联上下文是否充分”。
+- ProjectProfile 在 Prompt 中按批次生成相关切片：始终保留语言、框架、Workspace、有效规则和来源哈希，只携带匹配当前路径的规范、关键入口和 companion 信息。不得为每个批次重复注入全部画像文本。
+- 当 `workset_coverage=full` 但 `context_sufficiency=limited` 时，可以发布已验证 Finding，但零 Finding 文案必须写为“未发现达到阈值的问题，但上下文受限”，不能写成无条件的完整结论。
+
+仓库配置使用严格白名单 Schema，完整模板见 `examples/project-profile/.ai-review.yml`。平台 `project_configs.supported_extensions` 和 `ignore_paths` 提供默认文件范围；可信目标分支的 `.ai-review.yml` 可用顶层同名字段分别整体替换默认列表，字段缺省则继承平台值。覆盖结果连同 ProjectProfile 原子冻结到 ReviewJob 的 Effective Plan，参与 `plan_hash`，保证重试一致。其余白名单字段包括 `source_dirs`、`test_dirs`、`generated_dirs`、`key_paths`、`standards` 和 `companion_patterns`；项目仍不得提供 System Prompt、Parser 命令、模型端点、凭证、数据策略、预算或发布策略。
 
 `ContextManifest` 必须记录每个文件：
 
@@ -519,7 +559,7 @@ Prompt Envelope 固定分层：
 
 1. 不可覆盖的 System Safety、信任边界和禁止事项。
 2. 输出 JSON Schema、Severity 和 Finding Scope 契约。
-3. 版本化 Reviewer Policy。
+3. 版本化 Reviewer Policy；`summary` 和 Finding 的 `title`、`description`、`suggestion` 必须使用简体中文，源码 Evidence、路径、Rule ID、枚举值和代码标识保持原文。
 4. 已编译的适用规则。
 5. ProjectProfile，明确标记为不可信项目数据。
 6. MR 元数据、Diff 和代码上下文，明确标记为不可信数据。
@@ -532,6 +572,7 @@ Finding 契约补充：
 - 提供受控的通用 fallback Rule ID，不接受模型自由发明 ID。
 - `scope` 区分 `diff_line | changed_file | mr`；只有 `diff_line` 可以进入后续行级评论。
 - `evidence` 只包含模型实际看到的 literal source quote；路径和行号必须使用独立字段。
+- 新版 Prompt 对用户可见自然语言执行中文契约校验；Schema 合法但未输出中文时进入一次有预算、有审计的 Repair，二次仍不合规则按无效输出处理，禁止直接发布英文原文。
 - `diff_line` Evidence 必须匹配对应 Diff 侧和行范围；`changed_file` Evidence 只能匹配该文件已提供的 Diff/片段。
 - 文件级或 MR 级问题必须提供来自已给上下文的证据和影响链。
 
@@ -542,11 +583,12 @@ Finding 契约补充：
 - 未匹配、已禁用或模型自造的 Rule ID 不得发布。
 - 合法 Evidence 包装不得造成真阳性误拒绝，错误文件、错误行号和语义改写不得通过。
 - Prompt Injection Fixture 不得改变输出 Schema、规则集合、模型端点或发布策略。
+- Schema 合法但自然语言为英文的 Fixture 必须触发 Repair，并产出中文字段；Evidence 不得被翻译或改写。
 - 固定响应的结构化契约测试 100% 通过。
 
 #### M3.2.1 确定性语法分析器
 
-当前状态：代码、148 项常规测试（138 passed、10 skipped）、Docker 固定 Node/TypeScript Runner、PostgreSQL/Redis 可靠性回归和 Alembic 往返门禁已完成。真实 Shadow MR `!32` 已在关闭 LLM 的 Worker 场景中产生 `syntax.typescript.TS1155` Finding，保存 `source_pass`、字面 Evidence 和第 1 行定位；Analyzer 失败会持久化 partial Coverage。测试项目仍保持 shadow，真实 GitLab 复验和多项目质量数据属于 M3.3/M3 退出门禁。
+当前状态：代码、167 项通过/10 项跳过的常规门禁、Docker 固定 Node/TypeScript Runner、PostgreSQL/Redis 可靠性回归和 Alembic 往返门禁已完成。真实 Shadow MR `!32` 已在关闭 LLM 的 Worker 场景中产生 `syntax.typescript.TS1155` Finding，保存 `source_pass`、字面 Evidence 和第 1 行定位；Analyzer 失败会持久化 partial Coverage。中文输出真实复验、多语言真实 MR 和质量数据属于 M3 退出门禁；受控 publish 只用于人工验收，不代表可以扩大试点。
 
 目标是把“文件是否存在语法错误”从概率性 LLM 判断中剥离。即使关闭 LLM，平台也应对已支持语言给出可复现、可定位的语法诊断；LLM 继续负责跨文件语义、业务逻辑、API 兼容性和修复影响分析。
 
@@ -617,9 +659,185 @@ SyntaxAnalysisResult
 
 为避免过度设计，首版 Batch 在单 ReviewJob 内执行。进程崩溃后允许整个任务重试并重复部分 LLM 调用，不承诺只恢复失败批次。只有重复成本或长任务失败率达到明确阈值时，才增加 `review_batches` 表和独立恢复状态机。
 
+#### M3.3.1 超长 Diff 完整分段
+
+当前状态：运行代码和专项自动化门禁已完成，等待真实超长 Diff MR 验收。
+
+实现约束：
+
+1. Context Builder 不再在 Batch Planner 前按单文件 16,000 字符截断 Diff；完整 unified diff 先按 hunk 边界拆分，单 hunk 仍过大时按 diff 行边界继续拆分并重写合法 hunk header。
+2. 每个分段记录稳定 `segment_id/index/count/new_line_start/new_line_end`；Batch Key 身份包含 `batch_planner_version + plan_hash + head_sha + manifest item_id + segment_id + rule_set_hash`，相同 Head 和计划必须可复现。
+3. 同一文件允许进入多个 ReviewBatch。Manifest 仍只保留一个文件项，不新增表；`review_batches[].segments` 保存执行明细。
+4. 文件的全部分段成功后才计入 `reviewed_files`。任一分段失败、被跳过或超出总预算时，文件计入 `incomplete_files`；已有成功分段时同时计入 `partially_reviewed_files`。
+5. Verifier 按路径合并全部分段的新侧新增行和 literal Evidence，不能因同一路径后段覆盖前段；确定性语法分析仍按完整文件、每路径一次执行。
+6. Coverage 区分 eligible、策略排除、完整审查和部分审查，并对未完成分段输出路径、分段序号、新侧行范围和稳定原因。`unsupported/ignored/binary` 属于策略排除，不单独把 eligible Coverage 降为 partial。
+7. 单批输入、最多批次、总输入、总调用和总时长仍是硬上限。预算不足时允许 partial，但必须做到“未评审分段可定位”，不得静默丢弃或宣称该文件已审查。
+
+边界：M3.3.1 不引入仓库 clone/cache、向量检索、新微服务、独立 Batch 状态表或 Agent。GitLab 明确返回 `too_large/collapsed` 且拿不到 Diff 的文件继续保留稳定失败原因；是否增加 base/head 原文重建 Diff，应基于真实出现频率和 GitLab 文件大小成本单独决策。
+
+专项验收：
+
+- 一个超过 16,000 字符且问题位于后半段的 Diff，所有 diff body 行必须恰好进入一个分段，后段 Finding 可通过 Verifier。
+- 同一文件跨三个 Batch 时，前两个成功仍不得计为 reviewed；全部成功后才变为 full。
+- 中间分段失败或总预算耗尽时，结果为 partial，Manifest 和 Note 能定位具体分段与行范围。
+- 倒置 GitLab 文件输入顺序后，Segment ID、Batch Key 和 Prompt Hash 保持稳定。
+
+#### M3.3.2 跨 Head Finding 一致性与定向上下文
+
+当前状态：代码与自动化门禁已完成，真实连续 Head Shadow 待验收，仍属于 M3 退出前 P1。实现已包含父任务线性谱系、GitLab Compare、历史 Finding 确定性延续与定向复核、`persisting | resolved | uncertain | not_applicable` Transition、Head Delta 优先工作集、一跳直接 import、Batch ProfileSlice、Manifest v6 内容哈希和双维 Coverage。真实同一 MR 连续 Head 样本曾证明：两个上一 Head 已验证并发布的问题所对应文件在新 Head 中内容哈希完全相同，但新一轮 LLM 漏报，最终评论显示零 Finding；该场景已经进入自动化回归，真实环境修复复验尚未执行。
+
+目标同时满足两件事：
+
+1. 未修复的有效 Finding 不因新一轮模型漏报而从当前结论中消失。
+2. 修复提交及其影响范围仍进入新一轮审查，能够发现本次 Head 新增的问题；历史复核不能替代新增代码审查。
+
+```mermaid
+flowchart LR
+    Previous["上一成功 Head 与有效 Finding"] --> History["历史 Finding 重验证"]
+    Delta["previous_head -> current_head"] --> Fresh["本次 Head 增量审查"]
+    Current["target -> current_head 累计 MR"] --> Impact["累计一致性与影响面审查"]
+    Profile["Batch ProfileSlice 与定向关联文件"] --> History
+    Profile --> Fresh
+    Profile --> Impact
+    History --> Aggregate["Verifier / Transition / Aggregator"]
+    Fresh --> Aggregate
+    Impact --> Aggregate
+    Aggregate --> Outcome["当前 Head ReviewOutcome"]
+```
+
+执行契约：
+
+1. 新 Head 创建 ReviewJob 时，查找同项目、同 MR 最近一个可用的成功终态任务，通过现有 `parent_review_job_id` 形成线性审查谱系；没有上一任务时按首次评审执行。
+2. GitProvider 增加受控 Compare 能力，取得 `previous_head_sha -> current_head_sha` 的新增、修改、删除和重命名路径。Compare 不可用时退化为当前累计 MR 评审并记录 `HEAD_DELTA_UNAVAILABLE`，不得把退化伪装成已完成增量复核。
+3. 历史候选只取上一成功 Head 中 `validation_status=valid`、达到当前发布阈值且当前规则仍启用的 Finding。Rejected、低置信度、已被人工忽略或当前规则已禁用的 Finding 不延续。
+4. ContextManifest 为相关文件保存当前 Head 的完整内容哈希。历史 Finding 的文件内容哈希未变化、当前规则语义未变，且其结论不依赖已经变化的关联上下文时，直接复制为当前任务的 `persisting` Finding，不再次调用 LLM；这条确定性规则优先解决“代码没改但问题消失”。规则版本或必要关联上下文变化时进入定向复核，不能盲目延续。
+5. 历史 Finding 所在文件发生修改、重命名或删除时，使用旧 Finding、Head Delta、当前文件片段和必要关联上下文执行定向复核。Evidence 消失只能说明原锚点失效，不能单独证明问题已解决；结果必须是 `persisting | resolved | uncertain` 之一。
+6. 本次 Head Delta 始终形成新问题候选工作集，优先检查修改行、修改符号、同名测试、显式 companion 和公共入口。修复旧问题时引入的问题按 `new` Finding 发布；只有新缺陷与修复变更之间存在可验证影响链时才标记为“修复相关回归”，禁止仅因时间相邻推断因果关系。
+7. 仍保留 `target_sha -> current_head_sha` 的累计 MR 视角，用于检查本次增量与此前 MR 变更组合后的兼容性和跨文件一致性。三条通道是逻辑审查通道，不等于三次完整 LLM 调用；Planner 按稳定文件/分段身份合并重复上下文。
+8. Batch/Request 身份增加 `review_mode + previous_head_sha + history_hash + profile_slice_hash`；重试使用冻结输入。LLM 前和发布前继续校验 current Head，变化时旧任务进入 stale，不得覆盖新 Head 结果。
+
+上线兼容：若直接父任务创建于 M3.3.2 之前、没有 `finding_transitions`，允许执行一次有界遗留引导，向前查找同一 MR 的较早成功任务。只有原 Finding 文件在来源 Head 与 current Head 字节一致、当前规则语义仍一致时才恢复为历史候选；其余旧 Finding 不盲目延续并记录 `HISTORY_BOOTSTRAP_UNCERTAIN`。完成首个带 Transition 的任务后只沿线性谱系读取，不在每次评审中扫描全部历史。
+
+Finding 延续首版不新增历史表，以下描述是 M3.3.2 已实现基线：
+
+- 当前任务继续只保存属于当前 Head 的 Finding；确定性延续项复用原规则、证据和跨 Head 稳定 Fingerprint，并以 `source_pass=carry-forward` 标识来源。
+- `ContextManifest` 按 Finding Fingerprint 保存最小 `finding_provenance`：主文件内容哈希、Rule Hash、实际使用的关联文件及内容哈希。只有这些依赖满足延续条件时才走无 LLM 的确定性路径。
+- `ContextManifest` 增加 `finding_transitions`，记录上一 Finding ID/Fingerprint、`persisting | resolved | uncertain | not_applicable`、当前 Finding Fingerprint 和稳定 reason code。
+- GitLab 当前 Note 分区展示“仍存在的问题”“本次新发现”“已解决”和“无法确认”；数据库中的旧 ReviewJob 和旧 Finding 保持不可变。
+- 在线人工确认、误报抑制仍归 M5。后续真实“关闭旧 MR 后重建新 MR”样本已经证明仅靠同 MR Manifest 不足，因此 M3.3.4 只增加评审谱系当前状态表，仍不预建通用缺陷管理模型。
+
+定向上下文与预算策略：
+
+1. 历史 Finding 文件、本次 Delta 文件和 `.ai-review.yml` 声明路径均按精确路径读取，不依赖前 500 个 Repository Tree blob。
+2. 相关文件优先级固定为：匹配的 `companion_patterns`、当前变更的直接 import、同目录或同名测试、公共 API 入口、一般 `key_paths`。首版只解析一跳直接 import，并与现有最多 8 个关联文件及总 Token 预算共用上限；不做全仓反向依赖扫描。
+3. ProjectProfile 为每个 Batch 生成 `ProfileSlice`，只包含当前路径需要的框架事实、有效规则、规范摘录、关键入口和来源哈希。完整画像仍冻结在 ReviewJob，ProfileSlice Hash 进入请求身份。
+4. Tree 截断或画像总预算达到上限本身只保留诊断；显式要求的 companion、规范、直接依赖或历史复核上下文无法取得时，才将对应文件标记为 `context_sufficiency=limited` 并记录稳定原因。
+5. 预算优先级依次为：确定性 Analyzer、本次 Head Delta、发生变化的历史 Finding 定向复核、累计影响面。未执行工作必须进入 Manifest，不能用“未发现问题”替代。
+
+Coverage 和发布语义：
+
+| `workset_coverage` | `context_sufficiency` | 零 Finding 时允许的结论 |
+|---|---|---|
+| `full` | `sufficient` | 未发现达到发布阈值的问题 |
+| `full` | `limited` | 未发现达到发布阈值的问题，但部分文件上下文受限 |
+| `partial` | 任意值 | 评审未完整完成，列出未完成文件或分段 |
+
+专项验收：
+
+- 上一 Head 的有效 Finding 对应文件内容不变，即使本次模型返回零 Finding，当前 Outcome 仍保留该问题，且不为延续项新增 LLM 调用。
+- 修改问题文件并真实修复旧问题，同时在修复代码中引入独立缺陷：旧 Finding 为 `resolved`，新缺陷形成 `new` Finding；二者不得因 Fingerprint 去重互相覆盖。
+- 只移动、改写或删除旧 Evidence 时不得自动判定 resolved；定向复核失败或预算不足时为 `uncertain`，Note 明确披露。
+- 超过 500 个 blob 且画像达到 16,000 字符的 Fixture 中，位于 Tree 窗口外的历史文件和匹配 companion 仍能精确读取；无关 Tree 截断不降低 `workset_coverage`。
+- 必要 companion 读取失败时，代码工作集可为 full，但 `context_sufficiency` 必须为 limited，零 Finding 文案不得宣称完整无问题。
+- Compare 超时、快速连续 Push、重复 Webhook、Worker 重试和发布前 Head 变化均有稳定终态；同一 current Head 最多产生一条当前 Note。
+- 固定响应组件测试和全量 Pytest 已通过；PostgreSQL/Redis 可靠性基线沿用 M2/M3.3.1 已通过结果。至少一个真实连续 Head Shadow 场景通过后，才能把 M3.3.2 标记为“系统验收通过”。
+
+边界：M3.3.2 不引入仓库 Clone/持久化缓存、向量检索、通用 Symbol Graph、第二模型默认复核、新微服务或独立 Batch/Finding 历史表。若一跳 import 与显式 companion 的真实 Recall 不足，以 Golden/Shadow 数据决定是否在 M6 建增量符号索引。
+
+#### M3.3.3 基线完整性、发布边界与收敛控制
+
+当前状态：代码和自动化门禁已完成，真实 GitLab 连续 Head 验收待补。该版本不增加服务或批次表，继续使用同一 `ReviewJob + ContextManifest + Finding` 主链路。
+
+1. **基线分批续跑。** 单次 Worker 时间片耗尽时，将成功 Batch、已验证 Finding 和历史复核结果保存到 Manifest v8 检查点，通过 Outbox 延迟续投同一 ReviewJob。稳定 Batch Key 保证已成功批次不重复调用 LLM，只有最终完成或达到硬预算上限时才保存最终结果并写一次 Note。总输入和总调用预算跨续跑累计，续跑次数不超过计划批次数。
+2. **Finding 来源分类。** `Finding.origin_scope` 固定为 `historical | head_delta | impact_scope | cumulative`；行级 `head_delta` 必须同时命中 Compare Diff 新增行，不能只凭批次名称推断。
+3. **发布边界。** `Finding.publication_status` 与生命周期 `status` 分离。首个完整基线允许发布累计 Finding；连续 Head 只发布历史延续、Head Delta 和可验证影响域问题。累计视角新发现但无法证明由当前 Head 引入的问题保存为 `shadow_candidate`，不进入摘要或 GitLab 问题明细。
+4. **Review Epoch。** `review_epoch` 由项目/MR、目标分支基线引用、评审语义版本和人工重扫 nonce 生成。规则、Prompt、模型、项目范围、语法分析器或目标基线变化时切断旧父任务继承并建立新基线；批次、续跑、发布策略和 Verifier 实现升级不清空兼容历史。`POST /api/reviews/{id}/rescan` 可显式创建全量重扫任务。
+5. **基线状态。** Manifest 记录 `building | complete | incomplete`；只有 `workset_coverage=full` 且 `context_sufficiency=sufficient` 才是 complete，部分覆盖不得充当完整零问题证明。
+6. **收敛评测。** `evaluate-convergence` 对连续 Head 序列检查历史 Transition 完整性、非 Delta 发布、fix-only/no-op 新噪声以及双维 Coverage。任一 Head 不完整或出现越界发布均不通过。
+7. **空 Head Delta 快路径。** GitLab Compare 完整返回零文件、父任务基线为 complete/full/sufficient、历史 Finding 均可确定性延续且本次不是人工 Full Rescan 时，不再构建累计语义 Batch 或调用 LLM；Manifest v8 记录 `head_delta_file_count=0` 和 `no_op_head_delta=true`，沿用已发布 Finding、Transition 与 Provenance。Compare 截断/失败、父基线不完整或存在待复核历史问题时必须回退正常评审。
+
+专项验收：
+
+- 用时间预算在第二批前中断，确认同一 ReviewJob 续跑、首批 LLM 只调用一次、最终只写一次 Note。
+- 连续 Head 中，累计旧代码新发现保存为 `shadow_candidate`；本次新增行 Finding 为 `head_delta/published`。
+- 修改评审语义 Plan（规则、Prompt、模型、项目范围、语法分析器）或执行人工 rescan 后生成新 Epoch，不继承旧 Finding；仅执行版本升级不切断兼容历史，下一 Head 只继承同 Epoch 的发布问题。
+- fix-only 和 no-op 序列中不产生新的公开 Finding；每个上一 Head open Finding 都有 Transition，且所有 Head 为 full/sufficient。
+- 空提交产生的新 Head 不新增 `LLMRun`，已发布 Finding 指纹和 Provenance 保持不变；人工 Full Rescan 不命中快路径。
+
+边界：首版不增加 Batch 表、Finding 历史服务、候选人工提升 UI、第二模型复核、仓库缓存或符号索引。Shadow 候选治理仍由 M5 反馈闭环承接。
+
+#### M3.3.4 评审谱系与问题状态账本
+
+当前状态：运行代码、数据库迁移和自动化门禁已完成，真实 GitLab 重建 MR 验收仍属于 M3 退出前 P1。真实样本已证明：关闭旧 MR 后以相同代码新建 MR 时，按 MR IID 隔离的历史链路会被切断；即使 Head、目标基线、Plan、ProjectProfile、规则集和完整工作集相同，LLM 仍可能漏掉旧 MR 已验证问题。
+
+设计目标：
+
+1. 已验证且仍开放的问题不因 MR 展示窗口变化或 LLM 非确定性而消失。
+2. 不把文件、分支或仓库做成全局问题容器，避免不同开发者的交叉代码产生错误合并。
+3. `Finding` 保持不可变审计记录，账本只维护同一变更意图的当前状态投影。
+
+领域模型：
+
+```text
+Project
+  -> ReviewLineage
+       -> ReviewJob (MR/Head occurrence)
+            -> Finding (immutable occurrence)
+       -> LineageFindingState (current projection)
+```
+
+- `ReviewLineage` 表示平台能够证明可连续评审的一次代码变更意图，不等同于 MR IID、源分支或文件集合；无法证明连续性时宁可新建 Lineage，也不允许跨开发者或变更意图串线。
+- `Finding` 继续按 ReviewJob 保存每次实际产生或继承的 Occurrence，旧记录永不回写。
+- `LineageFindingState` 以 `review_lineage_id + fingerprint` 唯一，保存 `open | resolved | uncertain | not_applicable`、首次和最近来源 Job、最近验证 Head、Evidence、Rule Hash 及主文件/关联依赖 Provenance；评论发布状态继续归 ReviewJob。
+- 文件路径和行号只是 Evidence 定位属性，不能作为账本归属键。同一文件在两个独立 Lineage 中允许存在两个独立问题状态。
+
+谱系创建与跨 MR 关联规则：
+
+1. 首个 eligible MR 创建新 Lineage；同一 MR 后续 Head 直接沿用。
+2. `close` 但未合并的 MR 将 Lineage 标记为 `dormant`，`merge` 标记为 `completed`，同一 MR 的 `reopen` 重新激活原 Lineage；这些状态更新不创建 LLM 任务。只有 `dormant` Lineage 可以成为重建 MR 的自动关联候选。
+3. 关闭但未合并的旧 MR 被新 MR 替代时，只有同时满足同项目、源/目标分支一致、处于平台配置的有限替代窗口、评审语义兼容、目标基线兼容，并且 GitLab Compare 完整证明新 Head 与旧 Lineage 最近 Head 相同或为其后继，才允许自动关联。存在多个候选时不得自动选择。
+4. 相同 Head 直接从账本投影 `open` 问题；后继 Head 对主文件、规则和依赖均未变化的问题确定性延续，对变化问题执行定向复核。
+5. Compare 超时/截断、提交分叉、目标基线或评审语义不兼容、旧 MR 已合并、分支被复用时创建新 Lineage。禁止仅凭分支名、文件路径、标题相似度或模型判断关联。
+6. M3.3.4 启用后，Review Epoch 身份从 `project_id + mr_iid` 调整为 `project_id + review_lineage_id`；旧任务通过一次兼容迁移归属原 MR Lineage。人工 Full Rescan 创建新 Epoch，但是否保留 Lineage 身份由受控操作显式决定，不得静默清空或跨 Epoch 继承状态。
+
+账本更新与一致性：
+
+1. 只有评审计算完整、非 stale 且最终 Head 校验通过的 ReviewJob 可以推进账本；任务失败或评审不完整不能因“本轮未返回”删除旧 `open` 问题。GitLab Note 发送失败不回滚已验证的账本，但 ReviewJob 必须保留可重试的发布状态。
+2. 部分评审可以追加已验证的新 Finding，但不得把未覆盖文件上的旧 `open` Finding 自动改成 `resolved`。
+3. ReviewJob 结果、Finding Occurrence、Transition 和账本状态在同一数据库事务更新；GitLab Note 仍是结果投影，不是账本事实源。
+4. 使用 Lineage 当前 Head/版本做条件更新，旧 Head 晚完成时不得覆盖新 Head 状态。并发冲突进入 stale 或重新读取，不做最后写入者获胜。
+5. `resolved` 必须来自确定性不适用或有完整上下文的定向复核；Evidence 消失、模型漏报和预算不足只能是 `uncertain`。
+6. 旧 MR 关闭时冻结其 Note；新 MR 安全关联后创建自己的滚动 Note，展示账本当前 `open` 问题和本次 Transition。
+
+仓库级治理边界：
+
+- 后期可以生成只读的相似问题关联，用于趋势、规则命中和人工分析，但关联不共享状态、不自动解决、不自动继承、不影响发布。
+- Issue/Jira 同步、负责人、排期、SLA、误报确认和组织级处置工作流仍属于 M5 或外部缺陷管理系统。
+- 首版只增加 `review_lineages`、`lineage_finding_states` 和 `review_jobs.review_lineage_id`，不增加事件溯源服务、知识图谱、向量检索或独立微服务。
+
+专项验收：
+
+- 关闭未合并旧 MR，以相同 Head 新建 MR：零 LLM 重新发现依赖，旧 `open` Finding 指纹、Evidence 和 Provenance 出现在新 MR Note。
+- 新 MR Head 是旧 Head 后继：未修改问题保持，已修复问题进入 `resolved`，修改引入的新问题正常新增。
+- 两个开发者的独立 MR 修改同一文件和重叠行：必须属于不同 Lineage，任何一方的 Transition 不得影响另一方。
+- 复用同名分支、目标分支已变化、Compare 不完整或旧 MR 已合并：不得自动继承。
+- 多个 dormant Lineage 同时满足分支条件时不得猜测归属，新 MR 创建独立 Lineage 并记录稳定诊断。
+- 快速连续 Push 和两个 Worker 乱序完成时，账本最终 Head 与 GitLab 当前 Head 一致，旧任务不能覆盖新状态。
+
 评测口径：
 
 - 数据集划分调优集和封存 Holdout，禁止用 Holdout 调 Prompt 后继续声称独立评测。
+- 数据集增加连续 Head 序列，分别标注旧问题保持、真实修复、问题迁移、修复引入新问题和目标分支变化，不能只评测相互独立的单次 MR。
 - Finding 匹配至少使用 `rule_id + file + 允许行范围`。
 - 检出、定位、Severity、证据有效性分别计分。
 - Recall 只在具有已标注缺陷的样本上计算；普通线上 MR 只计算接受率和误报反馈。
@@ -633,6 +851,10 @@ M3 建议退出门槛：
 | 未验证原始输出发布 | 0 |
 | 注入导致越权或写操作 | 至少 20 个对抗样本，0 次 |
 | Eligible 文件覆盖 | 100% 进入 Batch 或具有稳定 reason code |
+| 跨 Head 保持 | 文件、规则及必要关联上下文未变化的上一 Head publishable Finding，当前 Head 保持率 100% |
+| 重建 MR 继承 | 满足严格关联条件的相同 Head open Finding 继承率 100%；不满足条件的误继承为 0 |
+| Head Delta 覆盖 | 100% 进入 Batch、确定性复核或具有稳定 reason code |
+| 显式上下文 | 匹配的 companion/standard/history 路径 100% 成功读取或记录稳定 reason code |
 | Publishable Precision | 建议不低于 75%，且至少 40 条 Finding |
 | High/Critical Precision | 建议不低于 85%；分母不足 20 时标记样本不足 |
 | 已标注缺陷 Recall | 建议不低于 60%，且至少 40 个已标注缺陷参与计算 |
@@ -650,7 +872,7 @@ M3 建议退出门槛：
 | 维度 | 对外含义 |
 |---|---|
 | Lifecycle | queued/running/succeeded/failed/skipped 和 current_stage |
-| Coverage | full/partial/none，reviewed/skipped/failed 和 reason 聚合 |
+| Coverage | `workset_coverage`、`context_sufficiency`、reviewed/incomplete/policy-excluded 和 reason 聚合 |
 | Publication | shadow/pending/published/failed/stale |
 | Provenance | config、Prompt、Rule Set、模型别名、Context Strategy 版本 |
 | Effective Config | 最终规则、配置来源、忽略/冲突原因和平台钳制结果 |
@@ -762,7 +984,10 @@ M5 通知验收：
 |---|---|---|
 | 项目禁用、Draft、无支持文件 | skipped，记录原因 | 否或发布受控说明，按项目策略 |
 | Catalog/Plan 无效 | 永久失败，LLM 调用为 0 | 否 |
-| Optional ProjectProfile 文件失败或声明路径不存在 | 保留已取得画像，记录稳定 Coverage limitation | 可发布部分结果 |
+| Optional ProjectProfile 推断文件失败或无关 Tree 截断 | 保留已取得画像，只记录画像诊断，不自动降低代码工作集覆盖 | 可发布 |
+| 当前批次必要 companion/standard/history 上下文不可用 | 保留已完成代码审查，`context_sufficiency=limited` 并禁止无条件零问题结论 | 可发布受限结果 |
+| previous/current Head Compare 不可用 | 退化为累计 MR 审查，记录 `HEAD_DELTA_UNAVAILABLE`，不宣称已完成增量复核 | 可发布受限结果 |
+| 历史 Finding 文件已变且定向复核失败或预算不足 | 不自动判定 resolved，transition 记为 uncertain | 可发布受限结果 |
 | GitLab/LLM 429、5xx、Timeout | 有界退避，遵守 Retry-After 和总预算 | 成功后发布 |
 | LLM 两次输出均无效 | 当前 Batch 失败，不发布原始文本 | 仅在其他 Batch 有效时发布 partial |
 | 部分 Batch 失败或预算耗尽 | 保存有效 Finding，Coverage=partial | 是，必须公开限制 |
@@ -799,9 +1024,14 @@ M5 通知验收：
 | 仓库内容 Prompt Injection | 高 | 可信分支、字段白名单、分层 Prompt、数据标记和对抗测试 |
 | Prompt/模型升级静默退化 | 高 | 不可变版本、完整 Hash、Holdout、Shadow 和回滚 |
 | 大 MR 静默漏审 | 高 | Batch、ContextManifest、Coverage reason 和总预算 |
+| 同一未修改问题在新 Head 消失 | 高 | 上一成功任务谱系、内容哈希、历史 Finding 确定性延续和变化后定向复核 |
+| 只复核旧问题而漏掉修复引入的新问题 | 高 | Head Delta 独立工作集、累计 MR 一致性视角和确定性跨通道去重 |
+| Tree/画像预算提示被误解为代码完整结论 | 高 | 分离 `workset_coverage` 与 `context_sufficiency`，必要上下文缺失时限制零 Finding 文案 |
 | Verifier 过严误杀真阳性 | 高 | literal Evidence 契约、有限 Normalizer、Diff 行映射、稳定拒绝码和 Shadow 回归 |
 | 语法 Analyzer 执行不可信项目代码 | 高 | 只解析文件字节、固定版本 Adapter、无 Shell/网络/依赖安装、资源上限和失败降级 |
 | 旧 Head 结果污染新 MR | 高 | 发布前二次校验和滚动 Note |
+| 关闭旧 MR 后问题状态丢失 | 高 | `ReviewLineage`、状态账本、严格 Head/基线/语义关联和新 MR 投影 |
+| 交叉代码造成跨 MR 串线 | 高 | Lineage 隔离、候选唯一，禁止按文件、分支名或相似度自动合并生命周期 |
 | 消息重放或补偿重复执行 | 已基本控制 | Outbox、原子领取、Fingerprint 和 Note Upsert |
 | LLM 重复调用增加成本 | 中 | 承认至少一次语义，记录每次调用和总预算 |
 | 源码或凭据泄露 | 高 | 私有部署、TLS、凭据引用、脱敏、RBAC 和保留期 |
@@ -815,6 +1045,7 @@ M5 通知验收：
 - Git 版本化 Prompt/Rule Catalog。
 - 小型、受控、带来源的 ProjectProfile。
 - 单 ReviewJob 内分批和确定性聚合。
+- 基于上一成功 ReviewJob 的单层历史复核，以及一跳 import/显式 companion 的定向上下文。
 - GitLab MR 作为开发者工作台，Dashboard 作为治理台。
 
 没有数据证明前不建设：
@@ -822,6 +1053,7 @@ M5 通知验收：
 - Prompt/Rule 数据库 Registry 和可视化流程编排器。
 - 通用规则 DSL、组织级复杂继承和自动规则学习。
 - ReviewBatch 独立状态机和通用工作流引擎。
+- 独立 Finding 历史服务、仓库级共享问题生命周期、仅凭相似度的全局自动合并、全仓反向依赖扫描和长期仓库缓存。
 - 向量数据库、全仓 RAG、通用 Symbol Graph。
 - 多 Agent、多模型默认复核和 Agent 控制台。
 - 独立 Analyzer 服务、LSP 集群、自动安装项目依赖和全项目编译平台。
@@ -831,15 +1063,16 @@ M5 通知验收：
 
 ## 12. 建议执行顺序
 
-下一阶段按一个发布门禁和四个迭代推进：
+下一阶段按以下顺序推进，每一步全量门禁通过后才能进入下一步：
 
-1. **发布门禁：M3.0.1。** 修复 Evidence 误拒绝，固化 MR `!32` Fixture，在真实 Shadow 复验通过前保持测试项目为 `shadow`。
-2. **迭代一：M3.1。** 建立 Seed Dataset、评测入口、ProjectProfile 和 ContextManifest。
-3. **迭代二：M3.2。** 建立文件型 Rule/Prompt Catalog、Compiler、PromptAssembler、Rule ID 和 Evidence 契约验证。
-4. **迭代三：M3.2.1。** 建立确定性 SyntaxAnalyzer Registry 和首批 TS/TSX、Python、JSON、YAML Adapter，以关闭 LLM 的 MR `!32` 回归作为门禁。
-5. **迭代四：M3.3。** 建立 Batch/Aggregator、Coverage、50 个 MR 数据集、Holdout 和两个项目 Shadow 验证。
+1. **P1：M3.3.3 真实验收。** 在同一 MR 连续提交中验证续跑、旧问题保持/解决、Head Delta 新问题、累计候选不公开、空 Head Delta 零 LLM 调用、Review Epoch 重置和收敛评测；通过前不扩大 publish。
+2. **P1：M3.3.4 真实验收。** 代码已增加 `review_lineages` 与 `lineage_finding_states`，并只在同项目、源/目标分支一致、有限窗口、相同或后继 Head、唯一候选、基线和评审语义兼容时继承。用真实 GitLab 验证相同 Head、后继 Head、分叉/歧义候选和 Worker 乱序；通过前不扩大 publish。
+3. **专项真实复验。** 完成 M3.0.1 Evidence Shadow、M3.3.1 超长 Diff MR，以及至少一个“旧问题保持 + 修复引入新问题”的连续 Head Shadow 场景。
+4. **质量数据。** 人工裁决现有种子样本，扩展到 50 个 Golden MR，并加入连续 Head 序列和 Holdout。
+5. **M3 退出验收。** 在两个真实项目执行 Shadow，达到 Coverage、Precision、Recall、零噪声和跨 Head 保持门槛。
+6. **现场与治理。** 补 M1 企业 GitLab Staging 契约和 M0 发布治理，再进入 M4 真实项目试点。
 
-M3 退出后补 M0 至 M2 的真实依赖系统验收，再进入 M4 真实项目试点。Dashboard 不先于质量、Read Model 和访问边界建设。
+Dashboard 不先于质量、Read Model 和访问边界建设。
 
 ## 13. 可核验参考与借鉴边界
 

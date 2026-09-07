@@ -4,6 +4,7 @@ from mr_review_platform.context import (
     build_context_pack,
     diff_added_line_map,
     diff_line_numbers,
+    split_diff_segments,
 )
 from mr_review_platform.project_profile import ProjectProfiler, RelatedPathSelection
 
@@ -29,6 +30,25 @@ def test_diff_added_line_map_preserves_literal_source() -> None:
         1: "export const s;",
         2: "  Mixed\tCase  ",
     }
+
+
+def test_hunk_segmentation_preserves_every_diff_body_line() -> None:
+    body = [f"+value_{index} = '{('x' * 80)}'" for index in range(80)]
+    diff = "@@ -0,0 +1,80 @@\n" + "\n".join(body)
+
+    segments = split_diff_segments(diff, max_chars=1_000)
+
+    assert len(segments) > 1
+    assert all(len(segment.diff) <= 1_000 for segment in segments)
+    assert [
+        line
+        for segment in segments
+        for line in segment.diff.splitlines()
+        if not line.startswith("@@")
+    ] == body
+    assert [segment.new_line_start for segment in segments] == sorted(
+        segment.new_line_start for segment in segments if segment.new_line_start is not None
+    )
 
 
 def test_context_keeps_deleted_files_without_loading_content() -> None:
@@ -78,9 +98,11 @@ def test_context_filters_unsupported_and_ignored_files() -> None:
         "unsupported",
     }
     assert context.manifest is not None
-    assert context.manifest.terminal_state == "partial"
+    assert context.manifest.terminal_state == "full"
     assert context.manifest.reviewed_files == 1
     assert context.manifest.skipped_files == 2
+    assert context.manifest.excluded_files == 2
+    assert context.manifest.incomplete_files == 0
     assert context.manifest.reason_counts == {"ignored_path": 1, "unsupported": 1}
 
 
@@ -115,7 +137,7 @@ def test_context_manifest_records_binary_too_large_and_fetch_failure() -> None:
     )
 
     assert context.manifest is not None
-    assert context.manifest.terminal_state == "none"
+    assert context.manifest.terminal_state == "partial"
     assert context.manifest.reason_counts == {
         "binary": 1,
         "fetch_failed": 1,
@@ -169,6 +191,72 @@ def test_context_adds_related_and_profile_files_with_provenance() -> None:
         "related_file",
         "project_profile",
     }
+    assert all(
+        item.content_hash is not None
+        for item in context.manifest.items
+        if item.source in {"changed_file", "related_file", "project_profile"}
+    )
+
+
+def test_profile_advisories_do_not_reduce_workset_or_context_sufficiency() -> None:
+    files = {
+        "package.json": '{"dependencies":{"react":"19"}}',
+        "src/app.ts": "export const value = true;\n",
+    }
+    profile = ProjectProfiler().build(
+        source_ref="b" * 40,
+        repository_paths=files,
+        file_loader=files.get,
+        tree_truncated=True,
+    )
+    context = build_context_pack(
+        project_path="team/demo",
+        mr={"iid": 7, "head_sha": "a" * 40},
+        raw_changes=[
+            {
+                "new_path": "src/app.ts",
+                "old_path": "src/app.ts",
+                "diff": "@@ -0,0 +1 @@\n+export const value = true;",
+            }
+        ],
+        supported_extensions=[".ts"],
+        ignore_paths=[],
+        project_rules=["correctness"],
+        max_input_tokens=1000,
+        file_loader=files.get,
+        project_profile=profile,
+    )
+
+    assert context.manifest is not None
+    assert context.manifest.workset_coverage == "full"
+    assert context.manifest.context_sufficiency == "sufficient"
+    assert any("仓库树已截断" in item for item in context.manifest.advisories)
+
+
+def test_required_related_file_failure_limits_context_but_not_workset() -> None:
+    context = build_context_pack(
+        project_path="team/demo",
+        mr={"iid": 7, "head_sha": "a" * 40},
+        raw_changes=[
+            {
+                "new_path": "src/app.py",
+                "old_path": "src/app.py",
+                "diff": "@@ -0,0 +1 @@\n+value = True",
+            }
+        ],
+        supported_extensions=[".py"],
+        ignore_paths=[],
+        project_rules=["correctness"],
+        max_input_tokens=1000,
+        file_loader=lambda path: "value = True\n" if path == "src/app.py" else None,
+        related_paths=[
+            RelatedPathSelection(path="contracts/schema.py", reason="companion_pattern:src/**")
+        ],
+    )
+
+    assert context.manifest is not None
+    assert context.manifest.workset_coverage == "full"
+    assert context.manifest.context_sufficiency == "limited"
 
 
 def test_context_manifest_is_canonical_across_input_order() -> None:
@@ -228,9 +316,10 @@ def test_context_manifest_marks_overflow_and_profile_degradation_as_partial() ->
     assert context.manifest.reviewed_files == 1
     assert context.manifest.terminal_state == "partial"
     assert context.manifest.limitations == tuple(sorted(set(context.limitations)))
-    assert any("overflowed" in item for item in context.manifest.limitations)
+    assert any("超出响应上限" in item for item in context.manifest.limitations)
     assert context.manifest.reason_counts["GITLAB_DIFF_LIST_TRUNCATED"] == 1
-    assert any("tree was truncated" in item for item in context.manifest.limitations)
+    assert any("仓库树已截断" in item for item in context.manifest.advisories)
+    assert not any("仓库树已截断" in item for item in context.manifest.limitations)
 
 
 def test_first_context_item_never_exceeds_small_total_budget() -> None:

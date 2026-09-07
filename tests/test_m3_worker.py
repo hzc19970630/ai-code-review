@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -9,16 +10,24 @@ from sqlalchemy import select
 
 from mr_review_platform import worker as worker_module
 from mr_review_platform.config import Settings
+from mr_review_platform.context import ChangeContext, ContextPack
 from mr_review_platform.db import Database
 from mr_review_platform.errors import ExternalServiceError
-from mr_review_platform.gitlab import RepositoryTree
+from mr_review_platform.gitlab import HeadComparison, RepositoryTree
 from mr_review_platform.llm import (
     LLMCallAuditEvent,
     LLMCallRecord,
     LLMReviewOutput,
     OpenAICompatibleLLM,
 )
-from mr_review_platform.models import Finding, LLMRun, Project, ReviewJob
+from mr_review_platform.models import (
+    Finding,
+    LineageFindingState,
+    LLMRun,
+    Project,
+    ReviewJob,
+    ReviewLineage,
+)
 from mr_review_platform.prompting import (
     PromptBudgetError,
     PromptEnvelope,
@@ -28,12 +37,13 @@ from mr_review_platform.prompting import (
     request_payload,
 )
 from mr_review_platform.review_plan import build_effective_review_plan, load_effective_review_plan
-from mr_review_platform.schemas import Coverage, FindingDraft, ReviewResult
+from mr_review_platform.schemas import Coverage, FindingDraft, HistoricalAssessment, ReviewResult
 from mr_review_platform.services import (
     ProjectRegistration,
     project_config_snapshot,
     register_project,
 )
+from mr_review_platform.verifier import VerifiedFinding
 
 
 def _settings(tmp_path, name: str) -> Settings:
@@ -116,6 +126,8 @@ class GitLabHarness:
     change_diff: str = "@@ -1,1 +1,1 @@\n-old = False\n+new = True"
     default_file_content: str = "new = True\n"
     raw_changes: list[dict[str, object]] | None = None
+    compare_diffs: tuple[dict[str, object], ...] = ()
+    compare_truncated: bool = False
 
     def client_type(self):
         harness = self
@@ -178,6 +190,12 @@ class GitLabHarness:
                     harness.default_file_content,
                 )
 
+            def compare_heads(self, _project_id, _from_sha, _to_sha):
+                return HeadComparison(
+                    diffs=tuple(dict(item) for item in harness.compare_diffs),
+                    truncated=harness.compare_truncated,
+                )
+
             def upsert_note(self, _project_id, _mr_iid, body, **_kwargs):
                 harness.note_bodies.append(body)
                 return "99"
@@ -197,6 +215,7 @@ class LLMHarness:
     error: Exception | None = None
     errors: list[Exception | None] = field(default_factory=list)
     review_count: int = 0
+    historical_assessments: list[HistoricalAssessment] = field(default_factory=list)
 
     def client_type(self):
         harness = self
@@ -279,6 +298,7 @@ class LLMHarness:
                         summary="No verified issues.",
                         coverage=Coverage(reviewed_files=1, skipped_files=0),
                         findings=[harness.finding] if harness.finding is not None else [],
+                        historical_assessments=harness.historical_assessments,
                     ),
                     request_hash=payload_hash,
                     calls=[
@@ -302,6 +322,59 @@ def _configure_worker(monkeypatch, settings, gitlab_harness, llm_harness) -> Non
     monkeypatch.setattr(worker_module, "OpenAICompatibleLLM", llm_harness.client_type())
 
 
+def _seed_history_parent_and_child(settings: Settings) -> tuple[Database, int, int, str]:
+    database, parent_id, _ = _seed_job(settings, publish_mode="publish")
+    fingerprint = "f" * 64
+    with database.session() as session:
+        parent = session.get(ReviewJob, parent_id)
+        assert parent is not None
+        parent.status = "succeeded"
+        parent.context_manifest = {"schema_version": "context-manifest/v5"}
+        session.add(
+            Finding(
+                review_job_id=parent.id,
+                project_id=parent.project_id,
+                mr_iid=parent.mr_iid,
+                head_sha=parent.head_sha,
+                severity="medium",
+                category="correctness",
+                rule_id="correctness.general",
+                scope="changed_file",
+                file_path="app.py",
+                title="危险开关仍然处于启用状态",
+                description="该开关会让错误路径继续执行。",
+                evidence="danger = True",
+                suggestion="关闭危险开关并补充回归测试。",
+                confidence=90,
+                fingerprint=fingerprint,
+                validation_status="valid",
+                source_pass="review",
+                status="open",
+            )
+        )
+        child = ReviewJob(
+            project_id=parent.project_id,
+            trigger_type="webhook",
+            parent_review_job_id=parent.id,
+            provider_project_id=parent.provider_project_id,
+            mr_iid=parent.mr_iid,
+            head_sha="b" * 40,
+            status="queued",
+            dedupe_key="m3-history-child",
+            review_strategy=parent.review_strategy,
+            prompt_profile=parent.prompt_profile,
+            prompt_version=parent.prompt_version,
+            result_schema_version=parent.result_schema_version,
+            config_snapshot=dict(parent.config_snapshot),
+            effective_plan=dict(parent.effective_plan or {}),
+            plan_hash=parent.plan_hash,
+            max_attempts=3,
+        )
+        session.add(child)
+        session.commit()
+        return database, parent.id, child.id, fingerprint
+
+
 def test_shadow_mode_saves_review_without_calling_gitlab_writer(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
     monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
@@ -317,13 +390,18 @@ def test_shadow_mode_saves_review_without_calling_gitlab_writer(tmp_path, monkey
         job = session.get(ReviewJob, job_id)
         assert job is not None
         assert job.status == "succeeded"
-        assert job.summary == "评审未完整完成：部分文件未完成 AI 语义评审，请查看 Coverage。"
+        assert job.summary == "未发现通过验证且达到发布阈值的问题。"
         assert job.context_files_count == 1
         assert job.markdown_result is not None
         assert job.gitlab_note_id is None
+        assert job.review_lineage_id is not None
+        lineage = session.get(ReviewLineage, job.review_lineage_id)
+        assert lineage is not None
+        assert lineage.current_head_sha == "a" * 40
+        assert session.scalar(select(LineageFindingState)) is None
         assert job.plan_hash == plan_hash
     assert gitlab.note_bodies == []
-    assert gitlab.head_reads == 1
+    assert gitlab.head_reads == 2
     assert llm.plan_hashes == [plan_hash]
 
 
@@ -464,9 +542,9 @@ def test_llm_failure_keeps_context_manifest_and_profile(tmp_path, monkeypatch) -
         assert job.context_manifest is not None
         assert job.project_profile is not None
         assert job.context_manifest["head_sha"] == "a" * 40
-        assert job.context_manifest["terminal_state"] == "none"
+        assert job.context_manifest["terminal_state"] == "partial"
         assert job.context_manifest["batch_failed_count"] == 1
-        assert job.summary == "评审未完整完成：部分文件未完成 AI 语义评审，请查看 Coverage。"
+        assert job.summary == "评审未完整完成：部分文件未完成 AI 语义评审，请查看覆盖情况。"
 
 
 def test_worker_persists_normalized_evidence_and_validation_code(tmp_path, monkeypatch) -> None:
@@ -501,7 +579,121 @@ def test_worker_persists_normalized_evidence_and_validation_code(tmp_path, monke
         assert finding.validation_status == "valid"
         assert finding.validation_code is None
         assert finding.evidence == "new = True"
+        job = session.get(ReviewJob, job_id)
+        assert job is not None
+        assert job.review_lineage_id is not None
+        state = session.scalar(
+            select(LineageFindingState).where(
+                LineageFindingState.review_lineage_id == job.review_lineage_id,
+                LineageFindingState.fingerprint == finding.fingerprint,
+            )
+        )
+        assert state is not None
+        assert state.status == "open"
+        assert state.latest_finding_id == finding.id
+        assert state.latest_head_sha == job.head_sha
     assert gitlab.note_bodies == []
+
+
+def test_same_head_rebuilt_mr_reuses_lineage_ledger_without_second_llm_call(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "rebuilt-mr-lineage.db")
+    database, first_job_id, _ = _seed_job(settings, publish_mode="shadow")
+    with database.session() as session:
+        first_job = session.get(ReviewJob, first_job_id)
+        assert first_job is not None
+        first_job.source_branch = "fix/behavior"
+        first_job.target_branch = "main"
+        session.commit()
+
+    finding = FindingDraft(
+        severity="high",
+        category="correctness",
+        rule_id="correctness.general",
+        scope="diff_line",
+        file_path="app.py",
+        line_start=1,
+        line_end=1,
+        title="变更后的行为不符合预期",
+        description="该值会使错误路径继续执行。",
+        evidence="new = True",
+        suggestion="恢复受保护的值并增加回归测试。",
+        confidence=95,
+    )
+    llm = LLMHarness(finding=finding)
+    first_gitlab = GitLabHarness(heads=["a" * 40])
+    _configure_worker(monkeypatch, settings, first_gitlab, llm)
+    worker_module.process_review_job(first_job_id)
+
+    with database.session() as session:
+        first_job = session.get(ReviewJob, first_job_id)
+        assert first_job is not None
+        assert first_job.status == "succeeded"
+        assert first_job.review_lineage_id is not None
+        old_lineage_id = first_job.review_lineage_id
+        old_lineage = session.get(ReviewLineage, old_lineage_id)
+        assert old_lineage is not None
+        old_lineage.status = "dormant"
+        old_lineage.dormant_at = datetime.now(UTC)
+        old_lineage.version += 1
+
+        provisional = ReviewLineage(
+            project_id=first_job.project_id,
+            source_branch="fix/behavior",
+            target_branch="main",
+            current_mr_iid=8,
+            status="active",
+            latest_observed_head_sha=first_job.head_sha,
+        )
+        session.add(provisional)
+        session.flush()
+        rebuilt = ReviewJob(
+            project_id=first_job.project_id,
+            trigger_type="webhook",
+            review_lineage_id=provisional.id,
+            provider_project_id=first_job.provider_project_id,
+            mr_iid=8,
+            source_branch="fix/behavior",
+            target_branch="main",
+            head_sha=first_job.head_sha,
+            status="queued",
+            dedupe_key="rebuilt-mr-same-head",
+            review_strategy=first_job.review_strategy,
+            prompt_profile=first_job.prompt_profile,
+            prompt_version=first_job.prompt_version,
+            result_schema_version=first_job.result_schema_version,
+            config_snapshot=dict(first_job.config_snapshot),
+            effective_plan=dict(first_job.effective_plan or {}),
+            plan_hash=first_job.plan_hash,
+            max_attempts=3,
+        )
+        session.add(rebuilt)
+        session.commit()
+        rebuilt_id = rebuilt.id
+
+    rebuilt_gitlab = GitLabHarness(heads=["a" * 40])
+    _configure_worker(monkeypatch, settings, rebuilt_gitlab, llm)
+    worker_module.process_review_job(rebuilt_id)
+
+    with database.session() as session:
+        rebuilt = session.get(ReviewJob, rebuilt_id)
+        rebuilt_finding = session.scalar(
+            select(Finding).where(Finding.review_job_id == rebuilt_id)
+        )
+        assert rebuilt is not None
+        assert rebuilt.status == "succeeded"
+        assert rebuilt.review_lineage_id == old_lineage_id
+        assert rebuilt.parent_review_job_id == first_job_id
+        assert rebuilt_finding is not None
+        assert rebuilt_finding.source_pass == "carry-forward"
+        assert rebuilt.context_manifest["lineage_resolution_reason"] == (
+            "LINEAGE_INHERITED_SAME_HEAD"
+        )
+        assert rebuilt.context_manifest["no_op_head_delta"] is True
+    assert llm.review_count == 1
 
 
 def test_worker_persists_stable_rejection_code(tmp_path, monkeypatch) -> None:
@@ -603,6 +795,130 @@ def test_worker_builds_profile_from_target_ref_and_related_files_from_head(
             "security.general",
         }
     ]
+
+
+def test_profile_budget_advisories_do_not_make_successful_review_partial(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "profile-advisory.db")
+    database, job_id, _ = _seed_job(settings, supported_extensions=[".yml"])
+    target_ref = "c" * 40
+    head_ref = "a" * 40
+    gitlab = GitLabHarness(
+        heads=[head_ref],
+        change_path=".ai-review.yml",
+        change_diff="@@ -0,0 +1,1 @@\n+version: 1",
+        tree_paths=(
+            "eslint.config.js",
+            "package.json",
+            *(f"src/generated-{index}.py" for index in range(499)),
+        ),
+        repository_files={
+            (target_ref, ".ai-review.yml"): "version: 1\n",
+            (head_ref, ".ai-review.yml"): "version: 1\n",
+            (target_ref, "eslint.config.js"): "x" * 9_000,
+            (target_ref, "package.json"): "x" * 9_000,
+        },
+    )
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(job_id)
+
+    with database.session() as session:
+        job = session.get(ReviewJob, job_id)
+        assert job is not None
+        assert job.status == "succeeded"
+        assert job.summary == "未发现通过验证且达到发布阈值的问题。"
+        assert job.context_manifest is not None
+        assert job.context_manifest["terminal_state"] == "full"
+        assert job.context_manifest["reviewed_files"] == 1
+        assert job.context_manifest["batch_succeeded_count"] == 1
+        assert job.context_manifest["limitations"] == []
+        assert set(job.context_manifest["advisories"]) == {
+            "已达到项目画像字符预算上限",
+            "项目画像使用的仓库树已截断",
+        }
+
+    assert len(gitlab.note_bodies) == 1
+    assert "工作集覆盖：完整" in gitlab.note_bodies[0]
+    assert "上下文充分度：充分" in gitlab.note_bodies[0]
+    assert "评审未完整完成" not in gitlab.note_bodies[0]
+    assert "- 提示：已达到项目画像字符预算上限" in gitlab.note_bodies[0]
+    assert "- 提示：项目画像使用的仓库树已截断" in gitlab.note_bodies[0]
+
+
+def test_worker_freezes_and_uses_repository_scope_overrides(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "repository-scope.db")
+    database, job_id, platform_plan_hash = _seed_job(
+        settings,
+        publish_mode="shadow",
+        supported_extensions=[".py"],
+    )
+    target_ref = "c" * 40
+    head_ref = "a" * 40
+    gitlab = GitLabHarness(
+        heads=[head_ref],
+        tree_paths=("src/app.tsx", "app.py", "ignored/secret.tsx"),
+        raw_changes=[
+            {
+                "old_path": "src/app.tsx",
+                "new_path": "src/app.tsx",
+                "diff": "@@ -0,0 +1,1 @@\n+export const ok = true;",
+            },
+            {
+                "old_path": "app.py",
+                "new_path": "app.py",
+                "diff": "@@ -0,0 +1,1 @@\n+value = True",
+            },
+            {
+                "old_path": "ignored/secret.tsx",
+                "new_path": "ignored/secret.tsx",
+                "diff": "@@ -0,0 +1,1 @@\n+export const secret = true;",
+            },
+        ],
+        repository_files={
+            (target_ref, ".ai-review.yml"): (
+                "version: 1\nsupported_extensions: [.tsx]\nignore_paths: [ignored/**]\n"
+            ),
+            (head_ref, "src/app.tsx"): "export const ok = true;\n",
+        },
+    )
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(job_id)
+
+    with database.session() as session:
+        job = session.get(ReviewJob, job_id)
+        assert job is not None
+        assert job.status == "succeeded"
+        assert job.plan_hash != platform_plan_hash
+        assert job.project_profile is not None
+        assert job.project_profile["review_scope"] == {
+            "supported_extensions": [".tsx"],
+            "ignore_paths": ["ignored/**"],
+        }
+        assert job.context_manifest is not None
+        assert job.context_manifest["reviewed_files"] == 1
+        assert job.context_manifest["reason_counts"] == {
+            "ignored_path": 1,
+            "unsupported": 1,
+        }
+        resolved_plan = load_effective_review_plan(job.effective_plan, job.plan_hash)
+        assert resolved_plan.supported_extensions == (".tsx",)
+        assert resolved_plan.ignore_paths == ("ignored/**",)
+
+    assert llm.plan_hashes == [resolved_plan.plan_hash]
+    assert [item["new_path"] for item in llm.untrusted_contexts[0]["changes"]] == ["src/app.tsx"]
+    assert ("src/app.tsx", head_ref) in gitlab.file_reads
+    assert ("app.py", head_ref) not in gitlab.file_reads
+    assert ("ignored/secret.tsx", head_ref) not in gitlab.file_reads
 
 
 def test_project_profile_fetch_failure_is_explicitly_degraded() -> None:
@@ -750,10 +1066,15 @@ def test_head_change_before_publish_skips_job_without_creating_note(tmp_path, mo
         assert job.status == "skipped"
         assert job.error_code == "STALE_HEAD_BEFORE_PUBLISH"
         assert job.error_message == "MR head changed before publishing the review result"
-        assert job.summary == "评审未完整完成：部分文件未完成 AI 语义评审，请查看 Coverage。"
+        assert job.summary == "未发现通过验证且达到发布阈值的问题。"
         assert job.context_files_count == 1
         assert job.markdown_result is not None
         assert job.gitlab_note_id is None
+        assert job.review_lineage_id is not None
+        lineage = session.get(ReviewLineage, job.review_lineage_id)
+        assert lineage is not None
+        assert lineage.current_head_sha is None
+        assert session.scalar(select(LineageFindingState)) is None
     assert gitlab.note_bodies == []
     assert gitlab.head_reads == 2
     assert len(llm.request_hashes) == 1
@@ -805,9 +1126,9 @@ def test_retry_reuses_frozen_plan_and_produces_identical_request_hash(
         assert job is not None
         assert job.status == "succeeded"
         assert job.plan_hash == plan_hash
-        assert len(runs) == 2
+        assert len(runs) == 1
         assert [run.request_hash for run in runs] == llm.request_hashes
-    assert llm.plan_hashes == [plan_hash, plan_hash]
+    assert llm.plan_hashes == [plan_hash]
     assert len(set(llm.request_hashes)) == 1
     assert len(gitlab.note_bodies) == 1
 
@@ -821,6 +1142,67 @@ def _large_changes(count: int) -> list[dict[str, object]]:
         }
         for index in range(count)
     ]
+
+
+def _large_segmented_change() -> list[dict[str, object]]:
+    lines = [f'+value_{index} = "{("x" * 100)}"' for index in range(400)]
+    return [
+        {
+            "old_path": "src/huge.py",
+            "new_path": "src/huge.py",
+            "diff": "@@ -0,0 +1,400 @@\n" + "\n".join(lines),
+        }
+    ]
+
+
+def test_oversized_single_diff_is_reviewed_across_all_segments(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "segmented-diff.db")
+    database, job_id, _ = _seed_job(
+        settings,
+        publish_mode="shadow",
+        plan_updates={
+            "max_input_tokens": 8_000,
+            "max_batches": 4,
+            "max_total_input_tokens": 32_000,
+        },
+    )
+    gitlab = GitLabHarness(
+        heads=["a" * 40],
+        raw_changes=_large_segmented_change(),
+    )
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(job_id)
+
+    with database.session() as session:
+        job = session.get(ReviewJob, job_id)
+        assert job is not None
+        assert job.status == "succeeded"
+        assert job.context_manifest is not None
+        assert job.context_manifest["schema_version"] == "context-manifest/v8"
+        assert job.context_manifest["batch_planner_version"] == "batch-planner/v3"
+        assert job.context_manifest["terminal_state"] == "full"
+        assert job.context_manifest["reviewed_files"] == 1
+        assert job.context_manifest["incomplete_files"] == 0
+        assert job.context_manifest["batch_succeeded_count"] == 3
+        segments = [
+            segment
+            for batch in job.context_manifest["review_batches"]
+            for segment in batch["segments"]
+        ]
+        assert [segment["segment_index"] for segment in segments] == [1, 2, 3]
+    assert llm.review_count == 3
+    assert any(
+        "value_399" in change["diff"]
+        for context in llm.untrusted_contexts
+        for change in context["changes"]
+    )
 
 
 def test_multi_batch_review_audits_each_call_and_saves_and_publishes_once(
@@ -869,6 +1251,67 @@ def test_multi_batch_review_audits_each_call_and_saves_and_publishes_once(
         assert all(run.request_hash for run in runs)
         assert all(run.status == "succeeded" for run in runs)
     assert save_count == 1
+    assert len(gitlab.note_bodies) == 1
+
+
+def test_time_budget_continues_same_job_without_repeating_completed_batch(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "batch-continuation.db")
+    database, job_id, _ = _seed_job(
+        settings,
+        plan_updates={
+            "max_input_tokens": 5_000,
+            "max_batches": 5,
+            "max_total_input_tokens": 25_000,
+        },
+    )
+    gitlab = GitLabHarness(heads=["a" * 40], raw_changes=_large_changes(5))
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+    original_reserve = worker_module._ReviewCallBudget.reserve
+    block_second_batch = True
+
+    def reserve_with_one_time_slice(self, event):
+        nonlocal block_second_batch
+        if event.status == "running" and llm.review_count == 1 and block_second_batch:
+            block_second_batch = False
+            raise ExternalServiceError(
+                "time slice exhausted",
+                code="BATCH_TOTAL_TIME_BUDGET",
+                retryable=False,
+            )
+        return original_reserve(self, event)
+
+    monkeypatch.setattr(worker_module._ReviewCallBudget, "reserve", reserve_with_one_time_slice)
+
+    worker_module.process_review_job(job_id)
+    with database.session() as session:
+        job = session.get(ReviewJob, job_id)
+        assert job is not None
+        assert job.status == "queued"
+        assert job.context_manifest is not None
+        assert job.context_manifest["review_checkpoint"]["continuation_count"] == 1
+        assert job.context_manifest["batch_succeeded_count"] == 1
+        job.next_retry_at = None
+        session.commit()
+    assert llm.review_count == 1
+    assert gitlab.note_bodies == []
+
+    worker_module.process_review_job(job_id)
+
+    with database.session() as session:
+        job = session.get(ReviewJob, job_id)
+        assert job is not None
+        assert job.status == "succeeded"
+        assert job.attempt_count == 2
+        assert job.context_manifest is not None
+        assert job.context_manifest["review_checkpoint"] is None
+        assert job.context_manifest["batch_succeeded_count"] == 5
+        assert job.context_manifest["baseline_status"] == "complete"
+    assert llm.review_count == 5
     assert len(gitlab.note_bodies) == 1
 
 
@@ -956,7 +1399,7 @@ def test_retryable_llm_error_becomes_partial_on_last_job_attempt(tmp_path, monke
         assert job is not None
         assert job.status == "succeeded"
         assert job.context_manifest is not None
-        assert job.context_manifest["terminal_state"] == "none"
+        assert job.context_manifest["terminal_state"] == "partial"
         assert job.context_manifest["batch_failed_count"] == 1
 
 
@@ -970,6 +1413,81 @@ def _audit_event(call_no: int, estimated_input_tokens: int) -> LLMCallAuditEvent
         estimated_input_tokens=estimated_input_tokens,
         status="running",
     )
+
+
+def test_finding_origin_and_publication_boundary_use_head_delta_evidence() -> None:
+    context = ContextPack(
+        project_path="team/demo",
+        mr={"head_sha": "b" * 40},
+        changes=[
+            ChangeContext(
+                old_path="delta.py",
+                new_path="delta.py",
+                change_type="modified",
+                diff="@@ -1 +1 @@\n-old\n+new",
+                snippet="new\n",
+                added_lines={1},
+                additions=1,
+                deletions=1,
+                risk_score=100,
+                flags=["head_delta"],
+                head_delta_diff="@@ -1 +1 @@\n-old\n+new",
+            ),
+            ChangeContext(
+                old_path="cumulative.py",
+                new_path="cumulative.py",
+                change_type="modified",
+                diff="@@ -1 +1 @@\n-old\n+legacy",
+                snippet="legacy\n",
+                added_lines={1},
+                additions=1,
+                deletions=1,
+                risk_score=10,
+            ),
+        ],
+        skipped_files=[],
+        project_rules=[],
+        risk_hints=[],
+        limitations=[],
+        max_input_tokens=10_000,
+        estimated_tokens=100,
+    )
+
+    def finding(path: str | None, scope: str, fingerprint: str) -> VerifiedFinding:
+        return VerifiedFinding(
+            draft=FindingDraft(
+                severity="medium",
+                category="correctness",
+                rule_id="correctness.general",
+                scope=scope,
+                file_path=path,
+                line_start=1 if scope == "diff_line" else None,
+                title="问题",
+                description="影响行为",
+                evidence="new" if path == "delta.py" else "legacy",
+                confidence=90,
+            ),
+            fingerprint=fingerprint,
+            validation_status="valid",
+            validation_message=None,
+        )
+
+    classified = worker_module._classify_findings(
+        [
+            finding("delta.py", "diff_line", "a" * 64),
+            finding("cumulative.py", "changed_file", "b" * 64),
+            finding(None, "mr", "c" * 64),
+        ],
+        context=context,
+        review_mode="head_delta",
+        baseline_review=False,
+    )
+
+    assert [(item.origin_scope, item.publication_status) for item in classified] == [
+        ("head_delta", "published"),
+        ("cumulative", "shadow_candidate"),
+        ("impact_scope", "published"),
+    ]
 
 
 def test_review_call_budget_bounds_real_calls_input_and_time(monkeypatch) -> None:
@@ -1179,3 +1697,414 @@ def test_initial_preflight_budget_rejection_does_not_create_llm_call_audit(tmp_p
         runs = session.scalars(select(LLMRun).where(LLMRun.review_job_id == job_id)).all()
         assert runs == []
     assert request_count == 0
+
+
+def test_unchanged_historical_finding_is_carried_without_llm_revalidation(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "history-unchanged.db")
+    database, _parent_id, child_id, fingerprint = _seed_history_parent_and_child(settings)
+    content = "danger = True\n"
+    gitlab = GitLabHarness(
+        heads=["b" * 40],
+        change_diff="@@ -1 +1 @@\n-danger = False\n+danger = True",
+        repository_files={
+            ("a" * 40, "app.py"): content,
+            ("b" * 40, "app.py"): content,
+        },
+        default_file_content=content,
+    )
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(child_id)
+
+    with database.session() as session:
+        child = session.get(ReviewJob, child_id)
+        findings = session.scalars(select(Finding).where(Finding.review_job_id == child_id)).all()
+        assert child is not None
+        assert child.status == "succeeded"
+        assert [(item.fingerprint, item.source_pass) for item in findings] == [
+            (fingerprint, "carry-forward")
+        ]
+        assert child.context_manifest["head_delta_status"] == "available"
+        assert child.context_manifest["head_delta_file_count"] == 0
+        assert child.context_manifest["no_op_head_delta"] is False
+        assert child.context_manifest["finding_transitions"][0]["state"] == "persisting"
+        assert child.context_manifest["finding_provenance"][0]["fingerprint"] == fingerprint
+        assert "### 仍存在的问题" in (child.markdown_result or "")
+    assert llm.review_count == 1
+    assert llm.untrusted_contexts[0]["historical_findings"] == []
+
+    with database.session() as session:
+        child = session.get(ReviewJob, child_id)
+        assert child is not None
+        grandchild = ReviewJob(
+            project_id=child.project_id,
+            trigger_type="webhook",
+            parent_review_job_id=child.id,
+            provider_project_id=child.provider_project_id,
+            mr_iid=child.mr_iid,
+            head_sha="d" * 40,
+            status="queued",
+            dedupe_key="m3-history-grandchild",
+            review_strategy=child.review_strategy,
+            prompt_profile=child.prompt_profile,
+            prompt_version=child.prompt_version,
+            result_schema_version=child.result_schema_version,
+            config_snapshot=dict(child.config_snapshot),
+            effective_plan=dict(child.effective_plan or {}),
+            plan_hash=child.plan_hash,
+            max_attempts=3,
+        )
+        session.add(grandchild)
+        session.commit()
+        grandchild_id = grandchild.id
+
+    next_gitlab = GitLabHarness(
+        heads=["d" * 40],
+        change_diff="@@ -1 +1 @@\n-danger = False\n+danger = True",
+        repository_files={
+            ("b" * 40, "app.py"): content,
+            ("d" * 40, "app.py"): content,
+        },
+        default_file_content=content,
+    )
+    _configure_worker(monkeypatch, settings, next_gitlab, llm)
+
+    worker_module.process_review_job(grandchild_id)
+
+    with database.session() as session:
+        grandchild_finding = session.scalar(
+            select(Finding).where(Finding.review_job_id == grandchild_id)
+        )
+        grandchild = session.get(ReviewJob, grandchild_id)
+        assert grandchild_finding is not None
+        assert grandchild is not None
+        assert grandchild_finding.fingerprint == fingerprint
+        assert grandchild_finding.source_pass == "carry-forward"
+        assert grandchild.context_manifest["no_op_head_delta"] is True
+    assert llm.review_count == 1
+
+
+def test_empty_head_delta_skips_llm_for_complete_parent_baseline(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "history-no-op-head.db")
+    database, parent_id, child_id, fingerprint = _seed_history_parent_and_child(settings)
+    with database.session() as session:
+        parent = session.get(ReviewJob, parent_id)
+        assert parent is not None
+        parent.context_manifest = {
+            "schema_version": "context-manifest/v7",
+            "review_epoch_version": "review-epoch/v2",
+            "baseline_status": "complete",
+            "workset_coverage": "full",
+            "context_sufficiency": "sufficient",
+            "finding_transitions": [],
+        }
+        session.commit()
+
+    content = "danger = True\n"
+    gitlab = GitLabHarness(
+        heads=["b" * 40],
+        compare_diffs=(),
+        repository_files={
+            ("a" * 40, "app.py"): content,
+            ("b" * 40, "app.py"): content,
+        },
+        default_file_content=content,
+    )
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(child_id)
+
+    with database.session() as session:
+        child = session.get(ReviewJob, child_id)
+        findings = session.scalars(select(Finding).where(Finding.review_job_id == child_id)).all()
+        runs = session.scalars(select(LLMRun).where(LLMRun.review_job_id == child_id)).all()
+        assert child is not None
+        assert child.status == "succeeded"
+        assert child.changed_files_count == 0
+        assert child.context_files_count == 0
+        assert child.context_manifest["schema_version"] == "context-manifest/v8"
+        assert child.context_manifest["head_delta_status"] == "available"
+        assert child.context_manifest["head_delta_file_count"] == 0
+        assert child.context_manifest["no_op_head_delta"] is True
+        assert child.context_manifest["baseline_status"] == "complete"
+        assert child.context_manifest["workset_coverage"] == "full"
+        assert child.context_manifest["batch_succeeded_count"] == 0
+        assert child.context_manifest["finding_transitions"][0]["state"] == "persisting"
+        assert [(item.fingerprint, item.source_pass) for item in findings] == [
+            (fingerprint, "carry-forward")
+        ]
+        assert runs == []
+        assert "AI 语义评审：空 Head Delta" in (child.markdown_result or "")
+        assert "### 仍存在的问题" in (child.markdown_result or "")
+    assert llm.review_count == 0
+    assert len(gitlab.note_bodies) == 1
+
+
+def test_review_epoch_change_detaches_incompatible_history(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "history-new-epoch.db")
+    database, parent_id, child_id, _ = _seed_history_parent_and_child(settings)
+    with database.session() as session:
+        parent = session.get(ReviewJob, parent_id)
+        assert parent is not None
+        parent.plan_hash = "0" * 64
+        session.commit()
+    gitlab = GitLabHarness(heads=["b" * 40])
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(child_id)
+
+    with database.session() as session:
+        child = session.get(ReviewJob, child_id)
+        assert child is not None
+        assert child.status == "succeeded"
+        assert child.parent_review_job_id is None
+        assert child.context_manifest is not None
+        assert child.context_manifest["previous_review_job_id"] is None
+        assert child.context_manifest["finding_transitions"] == []
+        assert len(child.context_manifest["review_epoch"]) == 64
+        assert child.context_manifest["baseline_status"] == "complete"
+
+
+def test_epoch_derivation_upgrade_keeps_semantically_compatible_parent(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "history-epoch-upgrade.db")
+    database, parent_id, child_id, _ = _seed_history_parent_and_child(settings)
+    with database.session() as session:
+        parent = session.get(ReviewJob, parent_id)
+        assert parent is not None
+        # Simulate a completed task created before the current epoch derivation.
+        parent.context_manifest = {
+            "schema_version": "context-manifest/v6",
+            "review_epoch": "e" * 64,
+        }
+        session.commit()
+    gitlab = GitLabHarness(heads=["b" * 40])
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(child_id)
+
+    with database.session() as session:
+        child = session.get(ReviewJob, child_id)
+        assert child is not None
+        assert child.status == "succeeded"
+        assert child.parent_review_job_id == parent_id
+        assert child.context_manifest is not None
+        assert child.context_manifest["previous_review_job_id"] == parent_id
+        assert child.context_manifest["finding_transitions"]
+
+
+def test_changed_history_can_resolve_while_fresh_issue_is_published(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "history-resolved-new.db")
+    database, _parent_id, child_id, fingerprint = _seed_history_parent_and_child(settings)
+    gitlab = GitLabHarness(
+        heads=["b" * 40],
+        change_diff="@@ -1 +1 @@\n-danger = True\n+danger = False",
+        compare_diffs=(
+            {
+                "old_path": "app.py",
+                "new_path": "app.py",
+                "diff": "@@ -1 +1 @@\n-danger = True\n+danger = False",
+            },
+        ),
+        repository_files={
+            ("a" * 40, "app.py"): "danger = True\n",
+            ("b" * 40, "app.py"): "danger = False\n",
+        },
+        default_file_content="danger = False\n",
+    )
+    llm = LLMHarness(
+        finding=FindingDraft(
+            severity="medium",
+            category="correctness",
+            rule_id="correctness.general",
+            scope="diff_line",
+            file_path="app.py",
+            line_start=1,
+            title="关闭开关后缺少必要的替代处理",
+            description="新分支会直接跳过必须执行的处理。",
+            evidence="danger = False",
+            suggestion="补充关闭状态下的替代处理并增加测试。",
+            confidence=90,
+        ),
+        historical_assessments=[
+            HistoricalAssessment(
+                previous_fingerprint=fingerprint,
+                state="resolved",
+                explanation="当前代码已经关闭原有危险开关。",
+            )
+        ],
+    )
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(child_id)
+
+    with database.session() as session:
+        child = session.get(ReviewJob, child_id)
+        findings = session.scalars(select(Finding).where(Finding.review_job_id == child_id)).all()
+        assert child is not None
+        assert len(findings) == 1
+        assert findings[0].fingerprint != fingerprint
+        assert findings[0].source_pass == "review"
+        assert findings[0].origin_scope == "head_delta"
+        assert findings[0].publication_status == "published"
+        transition = child.context_manifest["finding_transitions"][0]
+        assert transition["state"] == "resolved"
+        assert transition["reason_code"] == "HISTORY_REVIEW_RESOLVED"
+        assert "### 已解决" in (child.markdown_result or "")
+        assert "### 问题" in (child.markdown_result or "")
+    assert (
+        llm.untrusted_contexts[0]["historical_findings"][0]["previous_fingerprint"] == fingerprint
+    )
+    assert "head_delta" in llm.untrusted_contexts[0]["changes"][0]["flags"]
+
+
+def test_renamed_history_is_revalidated_and_moves_the_persisting_finding(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "history-renamed.db")
+    database, _parent_id, child_id, fingerprint = _seed_history_parent_and_child(settings)
+    content = "danger = True\n"
+    rename_diff = "@@ -1 +1 @@\n-danger = True\n+danger = True"
+    rename = {
+        "old_path": "app.py",
+        "new_path": "renamed.py",
+        "renamed_file": True,
+        "diff": rename_diff,
+    }
+    gitlab = GitLabHarness(
+        heads=["b" * 40],
+        raw_changes=[rename],
+        compare_diffs=(rename,),
+        repository_files={
+            ("a" * 40, "app.py"): content,
+            ("b" * 40, "renamed.py"): content,
+        },
+        default_file_content=content,
+    )
+    llm = LLMHarness(
+        historical_assessments=[
+            HistoricalAssessment(
+                previous_fingerprint=fingerprint,
+                state="persisting",
+                explanation="文件移动后原问题仍然存在。",
+                current_evidence="danger = True",
+            )
+        ]
+    )
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(child_id)
+
+    with database.session() as session:
+        finding = session.scalar(select(Finding).where(Finding.review_job_id == child_id))
+        child = session.get(ReviewJob, child_id)
+        assert finding is not None
+        assert finding.fingerprint == fingerprint
+        assert finding.file_path == "renamed.py"
+        assert finding.source_pass == "carry-forward"
+        assert child is not None
+        assert child.context_manifest["finding_transitions"][0]["state"] == "persisting"
+    historical_prompt = llm.untrusted_contexts[0]["historical_findings"][0]
+    assert historical_prompt["previous_file_path"] == "app.py"
+    assert historical_prompt["file_path"] == "renamed.py"
+
+
+def test_missing_history_assessment_is_uncertain_and_limits_zero_finding_summary(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "history-uncertain.db")
+    database, _parent_id, child_id, _fingerprint = _seed_history_parent_and_child(settings)
+    gitlab = GitLabHarness(
+        heads=["b" * 40],
+        change_diff="@@ -1 +1 @@\n-danger = True\n+danger = False",
+        compare_diffs=(
+            {
+                "old_path": "app.py",
+                "new_path": "app.py",
+                "diff": "@@ -1 +1 @@\n-danger = True\n+danger = False",
+            },
+        ),
+        repository_files={
+            ("a" * 40, "app.py"): "danger = True\n",
+            ("b" * 40, "app.py"): "danger = False\n",
+        },
+        default_file_content="danger = False\n",
+    )
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(child_id)
+
+    with database.session() as session:
+        child = session.get(ReviewJob, child_id)
+        assert child is not None
+        assert child.context_manifest["workset_coverage"] == "full"
+        assert child.context_manifest["context_sufficiency"] == "limited"
+        assert child.context_manifest["finding_transitions"][0]["state"] == "uncertain"
+        assert "部分文件上下文受限" in (child.summary or "")
+        assert "### 无法确认" in (child.markdown_result or "")
+
+
+def test_mr_scope_history_is_sent_to_bounded_revalidation_instead_of_auto_resolving(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "history-mr-scope.db")
+    database, _parent_id, child_id, fingerprint = _seed_history_parent_and_child(settings)
+    with database.session() as session:
+        parent_finding = session.scalar(select(Finding).where(Finding.fingerprint == fingerprint))
+        assert parent_finding is not None
+        parent_finding.scope = "mr"
+        parent_finding.file_path = None
+        parent_finding.line_start = None
+        parent_finding.line_end = None
+        session.commit()
+
+    gitlab = GitLabHarness(
+        heads=["b" * 40],
+        repository_files={("b" * 40, "app.py"): "danger = False\n"},
+        default_file_content="danger = False\n",
+    )
+    llm = LLMHarness(
+        historical_assessments=[
+            HistoricalAssessment(
+                previous_fingerprint=fingerprint,
+                state="resolved",
+                explanation="当前 MR 已经消除原有的跨文件风险。",
+            )
+        ]
+    )
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(child_id)
+
+    with database.session() as session:
+        child = session.get(ReviewJob, child_id)
+        assert child is not None
+        assert child.context_manifest["finding_transitions"][0]["state"] == "resolved"
+        assert session.scalar(select(Finding).where(Finding.review_job_id == child_id)) is None
+    assert llm.untrusted_contexts[0]["historical_findings"][0]["file_path"] is None

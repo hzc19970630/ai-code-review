@@ -59,12 +59,25 @@ class Coverage(BaseModel):
     limitations: list[str] = Field(default_factory=list, max_length=20)
 
 
-class ReviewResult(BaseModel):
+class HistoricalAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    previous_fingerprint: str = Field(min_length=1, max_length=128)
+    state: Literal["persisting", "resolved", "uncertain"]
+    explanation: str = Field(min_length=1, max_length=2000)
+    current_evidence: str | None = Field(default=None, max_length=2000)
+
+
+class ReviewResultV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     summary: str = Field(min_length=1, max_length=4000)
     coverage: Coverage
     findings: list[FindingDraft] = Field(default_factory=list, max_length=100)
+
+
+class ReviewResult(ReviewResultV1):
+    historical_assessments: list[HistoricalAssessment] = Field(default_factory=list, max_length=100)
 
 
 class FindingView(BaseModel):
@@ -86,6 +99,9 @@ class FindingView(BaseModel):
     validation_status: str
     validation_code: str | None
     validation_message: str | None
+    source_pass: str
+    origin_scope: str
+    publication_status: str
     status: str
 
 
@@ -107,6 +123,9 @@ class ReviewJobView(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    trigger_type: str
+    parent_review_job_id: int | None
+    review_lineage_id: int | None
     project_id: int
     mr_iid: int
     mr_title: str | None
@@ -116,6 +135,10 @@ class ReviewJobView(BaseModel):
     head_sha: str
     status: str
     review_outcome: Literal["full", "partial", "none"] | None = None
+    workset_coverage: Literal["full", "partial", "none"] | None = None
+    context_sufficiency: Literal["sufficient", "limited"] | None = None
+    review_epoch: str | None = None
+    baseline_status: Literal["building", "complete", "incomplete"] | None = None
     review_strategy: str
     plan_hash: str | None
     attempt_count: int
@@ -129,6 +152,13 @@ class ReviewJobView(BaseModel):
     gitlab_note_id: str | None
     error_code: str | None
     error_message: str | None
+
+
+class FullRescanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=500)
+    preserve_lineage: bool = True
 
 
 class Page(BaseModel):

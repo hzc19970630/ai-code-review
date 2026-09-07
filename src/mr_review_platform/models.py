@@ -84,6 +84,46 @@ class ProjectConfig(TimestampMixin, Base):
     project: Mapped[Project] = relationship(back_populates="config")
 
 
+class ReviewLineage(TimestampMixin, Base):
+    __tablename__ = "review_lineages"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'dormant', 'completed')",
+            name="ck_review_lineages_status",
+        ),
+        CheckConstraint("version >= 1", name="ck_review_lineages_version"),
+    )
+
+    id: Mapped[int] = mapped_column(ID_TYPE, primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(ID_TYPE, ForeignKey("projects.id"), nullable=False)
+    source_branch: Mapped[str | None] = mapped_column(String(255))
+    target_branch: Mapped[str | None] = mapped_column(String(255))
+    current_mr_iid: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    latest_observed_head_sha: Mapped[str | None] = mapped_column(String(64))
+    current_head_sha: Mapped[str | None] = mapped_column(String(64))
+    target_base_sha: Mapped[str | None] = mapped_column(String(64))
+    review_semantics_hash: Mapped[str | None] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    dormant_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+Index(
+    "ix_review_lineages_project_mr",
+    ReviewLineage.project_id,
+    ReviewLineage.current_mr_iid,
+)
+Index(
+    "ix_review_lineages_dormant_candidate",
+    ReviewLineage.project_id,
+    ReviewLineage.status,
+    ReviewLineage.source_branch,
+    ReviewLineage.target_branch,
+    ReviewLineage.dormant_at,
+)
+
+
 class WebhookEvent(Base):
     __tablename__ = "webhook_events"
 
@@ -115,6 +155,9 @@ class ReviewJob(TimestampMixin, Base):
     webhook_event_id: Mapped[int | None] = mapped_column(ID_TYPE, ForeignKey("webhook_events.id"))
     trigger_type: Mapped[str] = mapped_column(String(32), nullable=False, default="webhook")
     parent_review_job_id: Mapped[int | None] = mapped_column(ID_TYPE, ForeignKey("review_jobs.id"))
+    review_lineage_id: Mapped[int | None] = mapped_column(
+        ID_TYPE, ForeignKey("review_lineages.id")
+    )
     provider_project_id: Mapped[str] = mapped_column(String(128), nullable=False)
     mr_iid: Mapped[int] = mapped_column(Integer, nullable=False)
     mr_title: Mapped[str | None] = mapped_column(Text)
@@ -168,6 +211,7 @@ Index(
 )
 Index("ix_review_jobs_project_created", ReviewJob.project_id, ReviewJob.created_at)
 Index("ix_review_jobs_status_retry", ReviewJob.status, ReviewJob.next_retry_at)
+Index("ix_review_jobs_lineage_created", ReviewJob.review_lineage_id, ReviewJob.created_at)
 
 
 class OutboxEvent(TimestampMixin, Base):
@@ -238,6 +282,12 @@ class Finding(TimestampMixin, Base):
     validation_code: Mapped[str | None] = mapped_column(String(64))
     validation_message: Mapped[str | None] = mapped_column(Text)
     source_pass: Mapped[str] = mapped_column(String(64), nullable=False, default="review")
+    origin_scope: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="cumulative"
+    )
+    publication_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="published"
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     gitlab_discussion_id: Mapped[str | None] = mapped_column(String(255))
     gitlab_note_id: Mapped[str | None] = mapped_column(String(128))
@@ -247,6 +297,50 @@ class Finding(TimestampMixin, Base):
 
 Index("ix_findings_project_status", Finding.project_id, Finding.status)
 Index("ix_findings_project_severity", Finding.project_id, Finding.severity)
+Index(
+    "ix_findings_review_publication",
+    Finding.review_job_id,
+    Finding.publication_status,
+)
+
+
+class LineageFindingState(TimestampMixin, Base):
+    __tablename__ = "lineage_finding_states"
+    __table_args__ = (
+        UniqueConstraint("review_lineage_id", "fingerprint"),
+        CheckConstraint(
+            "status IN ('open', 'resolved', 'uncertain', 'not_applicable')",
+            name="ck_lineage_finding_states_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(ID_TYPE, primary_key=True, autoincrement=True)
+    review_lineage_id: Mapped[int] = mapped_column(
+        ID_TYPE,
+        ForeignKey("review_lineages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    first_review_job_id: Mapped[int] = mapped_column(
+        ID_TYPE, ForeignKey("review_jobs.id"), nullable=False
+    )
+    latest_review_job_id: Mapped[int] = mapped_column(
+        ID_TYPE, ForeignKey("review_jobs.id"), nullable=False
+    )
+    latest_finding_id: Mapped[int | None] = mapped_column(ID_TYPE, ForeignKey("findings.id"))
+    first_head_sha: Mapped[str] = mapped_column(String(64), nullable=False)
+    latest_head_sha: Mapped[str] = mapped_column(String(64), nullable=False)
+    finding_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    provenance: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    transition_reason: Mapped[str | None] = mapped_column(String(64))
+
+
+Index(
+    "ix_lineage_finding_states_current",
+    LineageFindingState.review_lineage_id,
+    LineageFindingState.status,
+)
 
 
 class LLMRun(Base):

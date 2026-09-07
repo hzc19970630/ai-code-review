@@ -30,6 +30,13 @@ class RepositoryTree:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class HeadComparison:
+    diffs: tuple[dict[str, Any], ...]
+    truncated: bool
+    is_descendant: bool = False
+
+
 class GitLabClient:
     """Small GitLab adapter with private-CA support and bounded retries."""
 
@@ -215,6 +222,56 @@ class GitLabClient:
         if "application/octet-stream" in content_type or b"\x00" in response.content[:8192]:
             return None
         return response.text
+
+    def compare_heads(self, project_id: str, from_sha: str, to_sha: str) -> HeadComparison:
+        response = self._request(
+            "GET",
+            f"/api/v4/projects/{self._project(project_id)}/repository/compare",
+            params={"from": from_sha, "to": to_sha, "straight": "true"},
+        )
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("diffs"), list):
+            raise ExternalServiceError(
+                "GitLab repository compare response is invalid",
+                code="GITLAB_RESPONSE_INVALID",
+                retryable=False,
+            )
+        diffs = payload["diffs"]
+        if any(not isinstance(item, dict) for item in diffs):
+            raise ExternalServiceError(
+                "GitLab repository compare diffs are invalid",
+                code="GITLAB_RESPONSE_INVALID",
+                retryable=False,
+            )
+        commits = payload.get("commits")
+        is_descendant = False
+        if isinstance(commits, list) and all(isinstance(item, dict) for item in commits):
+            parents_by_commit = {
+                str(item.get("id") or ""): tuple(
+                    str(parent) for parent in item.get("parent_ids") or ()
+                )
+                for item in commits
+                if item.get("id")
+            }
+            pending = [to_sha]
+            visited: set[str] = set()
+            while pending:
+                current = pending.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                for parent in parents_by_commit.get(current, ()):
+                    if parent == from_sha:
+                        is_descendant = True
+                        pending.clear()
+                        break
+                    if parent in parents_by_commit:
+                        pending.append(parent)
+        return HeadComparison(
+            diffs=tuple(_stable_diffs(diffs)),
+            truncated=bool(payload.get("compare_timeout")),
+            is_descendant=is_descendant,
+        )
 
     def list_repository_tree(
         self,

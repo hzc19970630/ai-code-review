@@ -46,3 +46,18 @@ Before changing any case to `approved`, two humans should verify the defect,
 location, rule identity, and severity. Historical or Shadow samples must be
 redacted before entering this repository. The M3.3 quality gate requires a
 separate holdout; do not tune prompts against that holdout.
+
+Evaluate a consecutive-Head convergence sequence without calling an LLM:
+
+```bash
+mr-review evaluate-convergence \
+  --sequence evaluation/convergence_sequence.json
+```
+
+Each non-baseline Head declares whether it is a `fix_only`,
+`fix_with_regression`, or `no_op` change. The report fails when a previous open
+Finding has no transition, a cumulative-only candidate is published, a fix-only
+or no-op Head emits a new public Finding, or any Head lacks full/sufficient
+coverage. The shipped sequence is only a schema and CLI example; replace its
+IDs and fingerprints with exported, human-adjudicated ReviewJob data for the
+M3 exit gate.

@@ -6,6 +6,10 @@ import pytest
 from pydantic import ValidationError
 
 from mr_review_platform.evaluation import (
+    ConvergenceFinding,
+    ConvergenceHead,
+    ConvergenceSequence,
+    ConvergenceTransition,
     EvaluationCase,
     EvaluationChangedFile,
     EvaluationFinding,
@@ -13,6 +17,7 @@ from mr_review_platform.evaluation import (
     PredictionCase,
     SeedDataset,
     dataset_summary,
+    evaluate_convergence,
     evaluate_dataset,
     load_seed_dataset,
 )
@@ -163,3 +168,93 @@ def test_shipped_seed_dataset_is_pending_human_and_covers_four_project_types() -
         "single_frontend",
     ]
     assert set(summary["languages"]) == {"Go", "Python", "TypeScript"}
+
+
+def test_convergence_evaluator_accepts_complete_fix_and_no_op_sequence() -> None:
+    fingerprint = "a" * 64
+    sequence = ConvergenceSequence(
+        sequence_id="fix-converges",
+        heads=(
+            ConvergenceHead(
+                review_job_id=1,
+                head_sha="1" * 40,
+                change_kind="baseline",
+                workset_coverage="full",
+                context_sufficiency="sufficient",
+                findings=(
+                    ConvergenceFinding(
+                        fingerprint=fingerprint,
+                        origin_scope="cumulative",
+                        publication_status="published",
+                    ),
+                ),
+            ),
+            ConvergenceHead(
+                review_job_id=2,
+                head_sha="2" * 40,
+                change_kind="fix_only",
+                workset_coverage="full",
+                context_sufficiency="sufficient",
+                previous_open_fingerprints=(fingerprint,),
+                transitions=(
+                    ConvergenceTransition(
+                        previous_fingerprint=fingerprint,
+                        state="resolved",
+                    ),
+                ),
+            ),
+            ConvergenceHead(
+                review_job_id=3,
+                head_sha="3" * 40,
+                change_kind="no_op",
+                workset_coverage="full",
+                context_sufficiency="sufficient",
+            ),
+        ),
+    )
+
+    report = evaluate_convergence(sequence)
+
+    assert report.passed is True
+    assert report.missing_transitions == 0
+    assert report.unexpected_fix_only_findings == 0
+    assert report.unexpected_no_op_findings == 0
+
+
+def test_convergence_evaluator_rejects_noise_and_incomplete_coverage() -> None:
+    fingerprint = "b" * 64
+    sequence = ConvergenceSequence(
+        sequence_id="non-converging",
+        heads=(
+            ConvergenceHead(
+                review_job_id=1,
+                head_sha="1" * 40,
+                change_kind="baseline",
+                workset_coverage="full",
+                context_sufficiency="sufficient",
+            ),
+            ConvergenceHead(
+                review_job_id=2,
+                head_sha="2" * 40,
+                change_kind="no_op",
+                workset_coverage="partial",
+                context_sufficiency="limited",
+                previous_open_fingerprints=("a" * 64,),
+                findings=(
+                    ConvergenceFinding(
+                        fingerprint=fingerprint,
+                        origin_scope="cumulative",
+                        publication_status="published",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    report = evaluate_convergence(sequence)
+
+    assert report.passed is False
+    assert report.complete_heads == 1
+    assert report.missing_transitions == 1
+    assert report.out_of_delta_published == 1
+    assert report.unexpected_no_op_findings == 1

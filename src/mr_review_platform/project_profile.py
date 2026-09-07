@@ -12,7 +12,7 @@ from pathlib import PurePosixPath
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 PROFILE_SCHEMA_VERSION = "project-profile/v1"
 PROFILE_POLICY_VERSION = "project-profile-policy/v1"
@@ -62,6 +62,7 @@ _SOURCE_DIR_NAMES = {"app", "apps", "cmd", "internal", "lib", "packages", "pkg",
 _TEST_DIR_NAMES = {"__tests__", "spec", "specs", "test", "tests"}
 _GENERATED_DIR_NAMES = {"build", "coverage", "dist", "generated", "out", "target"}
 _STANDARD_EXTENSIONS = {".md", ".rst", ".txt"}
+_REVIEW_EXTENSION_RE = re.compile(r"^\.[a-z0-9][a-z0-9._+-]{0,31}$")
 
 
 def _canonical_json(value: Any) -> str:
@@ -132,8 +133,30 @@ class RepositoryReviewConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: Literal[1] = 1
+    supported_extensions: list[str] | None = Field(default=None, min_length=1, max_length=64)
+    ignore_paths: list[str] | None = Field(default=None, max_length=128)
     profile: RepositoryProfileConfig = Field(default_factory=RepositoryProfileConfig)
     rules: RepositoryRuleConfig = Field(default_factory=RepositoryRuleConfig)
+
+    @field_validator("supported_extensions")
+    @classmethod
+    def normalize_supported_extensions(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized = sorted({str(item).strip().lower() for item in value})
+        if any(not _REVIEW_EXTENSION_RE.fullmatch(item) for item in normalized):
+            raise ValueError("supported_extensions must contain file suffixes such as .py")
+        return normalized
+
+    @field_validator("ignore_paths")
+    @classmethod
+    def normalize_ignore_paths(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized = [_safe_glob(str(item)) for item in value]
+        if any(item is None for item in normalized):
+            raise ValueError("ignore_paths must contain relative repository glob patterns")
+        return sorted({item for item in normalized if item is not None})
 
 
 class _NoAliasSafeLoader(yaml.SafeLoader):
@@ -187,6 +210,13 @@ class TrustedRuleConfig(BaseModel):
     path_rules: tuple[RulePathOverride, ...] = ()
 
 
+class TrustedReviewScopeConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    supported_extensions: tuple[str, ...] | None = None
+    ignore_paths: tuple[str, ...] | None = None
+
+
 class ProjectProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -204,6 +234,7 @@ class ProjectProfile(BaseModel):
     public_api_entries: tuple[str, ...] = ()
     key_paths: tuple[str, ...] = ()
     companion_patterns: tuple[CompanionRule, ...] = ()
+    review_scope: TrustedReviewScopeConfig = Field(default_factory=TrustedReviewScopeConfig)
     rule_config: TrustedRuleConfig = Field(default_factory=TrustedRuleConfig)
     standards: tuple[ProfileStandard, ...] = ()
     sources: tuple[ProfileSource, ...] = ()
@@ -211,7 +242,11 @@ class ProjectProfile(BaseModel):
     total_chars: int = Field(ge=0)
 
     def canonical_data(self) -> dict[str, Any]:
-        return self.model_dump(mode="json")
+        data = self.model_dump(mode="json")
+        # Keep hashes for profiles created before repository scope overrides stable.
+        if self.review_scope == TrustedReviewScopeConfig():
+            data.pop("review_scope", None)
+        return data
 
     @property
     def content_hash(self) -> str:
@@ -227,32 +262,18 @@ class ProjectProfile(BaseModel):
 
     def coverage_limitations(self) -> list[str]:
         messages = {
-            "PROFILE_NOT_CONFIGURED": (
-                "project profile is not configured; generic review context is used"
-            ),
-            "PROFILE_INFERRED": (
-                "project profile was inferred from target-branch manifests; "
-                "no approved repository profile configuration was found"
-            ),
-            "PROFILE_CONFIG_INVALID": (
-                "project profile configuration is invalid; inferred context is used"
-            ),
-            "PROFILE_FILE_FETCH_FAILED": (
-                "some optional project profile files could not be fetched"
-            ),
+            "PROFILE_NOT_CONFIGURED": ("项目画像未配置，当前使用通用评审上下文"),
+            "PROFILE_INFERRED": ("未找到已批准的仓库画像配置，当前根据目标分支清单推断项目画像"),
+            "PROFILE_CONFIG_INVALID": ("项目画像配置无效，当前使用推断上下文"),
+            "PROFILE_FILE_FETCH_FAILED": ("部分可选项目画像文件无法获取"),
             "PROFILE_DECLARED_PATH_NOT_FOUND": (
-                "a project profile path declared by .ai-review.yml was not found "
-                "on the trusted target ref"
+                ".ai-review.yml 声明的项目画像路径在可信目标版本中不存在"
             ),
-            "PROFILE_FILE_LIMIT": "project profile file limit was reached",
-            "PROFILE_TOTAL_BUDGET": "project profile character budget was reached",
-            "PROFILE_TREE_TRUNCATED": "project profile repository tree was truncated",
-            "PROFILE_TARGET_REF_UNAVAILABLE": (
-                "trusted target-branch ref is unavailable; generic project context is used"
-            ),
-            "PROFILE_START_REF_UNAVAILABLE": (
-                "target start ref is unavailable; project profile uses the merge base ref"
-            ),
+            "PROFILE_FILE_LIMIT": "已达到项目画像文件数量上限",
+            "PROFILE_TOTAL_BUDGET": "已达到项目画像字符预算上限",
+            "PROFILE_TREE_TRUNCATED": "项目画像使用的仓库树已截断",
+            "PROFILE_TARGET_REF_UNAVAILABLE": ("可信目标分支版本不可用，当前使用通用项目上下文"),
+            "PROFILE_START_REF_UNAVAILABLE": ("目标起始版本不可用，项目画像改用合并基准版本"),
         }
         return [messages[code] for code in self.limitations if code in messages]
 
@@ -363,6 +384,7 @@ class ProjectProfiler:
         configured = False
         profile_config = RepositoryProfileConfig()
         repository_rule_config = RepositoryRuleConfig()
+        trusted_review_scope = TrustedReviewScopeConfig()
         # The repository configuration has a fixed, trusted-target path. Reading it
         # directly avoids making its availability depend on the bounded tree window.
         config_text = read_profile_file(
@@ -378,6 +400,18 @@ class ProjectProfiler:
                 parsed_config = RepositoryReviewConfig.model_validate(raw_config)
                 profile_config = parsed_config.profile
                 repository_rule_config = parsed_config.rules
+                trusted_review_scope = TrustedReviewScopeConfig(
+                    supported_extensions=(
+                        tuple(parsed_config.supported_extensions)
+                        if parsed_config.supported_extensions is not None
+                        else None
+                    ),
+                    ignore_paths=(
+                        tuple(parsed_config.ignore_paths)
+                        if parsed_config.ignore_paths is not None
+                        else None
+                    ),
+                )
                 configured = True
             except (ValueError, TypeError, yaml.YAMLError, ValidationError):
                 limitations.add("PROFILE_CONFIG_INVALID")
@@ -490,6 +524,7 @@ class ProjectProfiler:
             companion_patterns=tuple(
                 sorted(companion_patterns, key=lambda item: (item.match, item.paths))
             ),
+            review_scope=trusted_review_scope,
             rule_config=trusted_rule_config,
             standards=tuple(sorted(standards, key=lambda item: item.path)),
             sources=tuple(sorted(sources, key=lambda item: (item.path, item.kind))),
@@ -676,6 +711,170 @@ def _safe_glob(pattern: str) -> str | None:
 class RelatedPathSelection:
     path: str
     reason: str
+
+
+def build_profile_slice(
+    profile: ProjectProfile,
+    *,
+    paths: Iterable[str],
+    max_standard_chars: int = MAX_STANDARD_CHARS,
+) -> dict[str, Any]:
+    """Build a stable, path-focused prompt view without mutating the frozen profile."""
+
+    selected_paths = tuple(sorted({path for path in paths if _safe_repo_path(path)}))
+    roots = {path.split("/", 1)[0] for path in selected_paths}
+    companion_patterns = tuple(
+        rule
+        for rule in profile.companion_patterns
+        if any(fnmatch(path, rule.match) for path in selected_paths)
+    )
+    key_paths = tuple(
+        path for path in profile.key_paths if not roots or path.split("/", 1)[0] in roots
+    )
+    standards: list[dict[str, Any]] = []
+    remaining = max_standard_chars
+    for standard in sorted(
+        profile.standards,
+        key=lambda item: (item.path.split("/", 1)[0] not in roots, item.path),
+    ):
+        if remaining <= 0 or len(standards) >= 2:
+            break
+        content = standard.content[:remaining]
+        if not content:
+            continue
+        standards.append(
+            {
+                "path": standard.path,
+                "content": content,
+                "content_hash": standard.content_hash,
+                "source_ref": standard.source_ref,
+            }
+        )
+        remaining -= len(content)
+
+    source_paths = {
+        *selected_paths,
+        *key_paths,
+        *(item.path for item in profile.sources if item.kind in {"manifest", "config"}),
+        *(item["path"] for item in standards),
+    }
+    payload: dict[str, Any] = {
+        "schema_version": "project-profile-slice/v1",
+        "profile_hash": profile.content_hash,
+        "source_ref": profile.source_ref,
+        "paths": selected_paths,
+        "languages": profile.languages,
+        "frameworks": profile.frameworks,
+        "package_managers": profile.package_managers,
+        "workspace_roots": profile.workspace_roots,
+        "source_dirs": profile.source_dirs,
+        "test_dirs": profile.test_dirs,
+        "generated_dirs": profile.generated_dirs,
+        "config_entries": profile.config_entries,
+        "public_api_entries": tuple(
+            path
+            for path in profile.public_api_entries
+            if not roots or path.split("/", 1)[0] in roots
+        ),
+        "key_paths": key_paths,
+        "companion_patterns": tuple(item.model_dump(mode="json") for item in companion_patterns),
+        "standards": tuple(standards),
+        "sources": tuple(
+            source.model_dump(mode="json")
+            for source in profile.sources
+            if source.path in source_paths
+        ),
+    }
+    return {**payload, "slice_hash": _sha256_text(_canonical_json(payload))}
+
+
+_JS_IMPORT_RE = re.compile(
+    r"(?:from\s+|import\s*\(|require\s*\()\s*['\"](?P<path>\.{1,2}/[^'\"]+)['\"]"
+)
+_PY_IMPORT_RE = re.compile(r"^\s*from\s+(?P<dots>\.+)(?P<path>[A-Za-z0-9_.]*)\s+import\s+", re.M)
+
+
+def select_direct_import_paths(
+    *,
+    changed_contents: dict[str, str],
+    repository_paths: Iterable[str],
+    profile: ProjectProfile,
+    file_loader: Callable[[str], str | None] | None = None,
+    max_files: int = 8,
+) -> list[RelatedPathSelection]:
+    """Resolve a bounded one-hop set of relative imports to exact repository paths."""
+
+    known = {
+        safe
+        for raw_path in repository_paths
+        if (safe := _safe_repo_path(str(raw_path))) is not None
+    }
+    known.update(profile.key_paths)
+    known.update(profile.public_api_entries)
+    known.update(source.path for source in profile.sources)
+    for rule in profile.companion_patterns:
+        known.update(rule.paths)
+    changed = set(changed_contents)
+    selected: set[str] = set()
+    probe_count = 0
+
+    def choose(base: str, suffix: str, *, python: bool = False) -> None:
+        nonlocal probe_count
+        if len(selected) >= max_files:
+            return
+        normalized = _safe_repo_path(base)
+        if normalized is None:
+            return
+        if PurePosixPath(normalized).suffix:
+            candidates = [normalized]
+        elif python:
+            candidates = [f"{normalized}.py", f"{normalized}/__init__.py"]
+        else:
+            extensions = [suffix, ".ts", ".tsx", ".js", ".jsx", ".vue"]
+            candidates = [
+                item
+                for extension in dict.fromkeys(extensions)
+                for item in (f"{normalized}{extension}", f"{normalized}/index{extension}")
+                if extension
+            ]
+        candidate = next((item for item in candidates if item in known), None)
+        if candidate is None and file_loader is not None:
+            for item in candidates:
+                if probe_count >= max_files * 6:
+                    break
+                probe_count += 1
+                try:
+                    if file_loader(item) is not None:
+                        candidate = item
+                        break
+                except Exception:
+                    continue
+            if candidate is None:
+                candidate = candidates[0]
+        if candidate is None:
+            return
+        if candidate not in changed:
+            selected.add(candidate)
+
+    for path, content in sorted(changed_contents.items()):
+        parent = posixpath.dirname(path)
+        suffix = PurePosixPath(path).suffix.lower()
+        if suffix in {".js", ".jsx", ".ts", ".tsx", ".vue"}:
+            for match in _JS_IMPORT_RE.finditer(content):
+                choose(posixpath.normpath(posixpath.join(parent, match.group("path"))), suffix)
+        elif suffix == ".py":
+            for match in _PY_IMPORT_RE.finditer(content):
+                levels = max(0, len(match.group("dots")) - 1)
+                base_parent = parent
+                for _ in range(levels):
+                    base_parent = posixpath.dirname(base_parent)
+                module = match.group("path").replace(".", "/")
+                choose(posixpath.join(base_parent, module), suffix, python=True)
+
+    return [
+        RelatedPathSelection(path=path, reason="direct_import")
+        for path in sorted(selected)[:max_files]
+    ]
 
 
 def select_related_paths(

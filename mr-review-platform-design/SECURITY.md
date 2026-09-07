@@ -136,7 +136,7 @@ Debug 日志也必须经过同一脱敏器，并设置短保留期和访问控�
 
 - LLM Gateway 根据项目数据策略选择允许的 Provider。
 - System Prompt 明确代码和 MR 文本是待分析数据，不能作为系统指令。
-- 仓库内 `.ai-review.yml` 只解析白名单字段并使用严格 Schema。
+- 仓库内 `.ai-review.yml` 只解析白名单字段并使用严格 Schema；`supported_extensions` 与 `ignore_paths` 只接受有界、规范化的后缀和相对仓库 Glob，并且只能从可信目标提交生效。仓库配置不能覆盖模型端点、凭证、数据策略、预算或发布模式。
 - 模型工具调用必须由本地策略层授权，模型不能自行扩大工具权限。
 - Finding 必须通过 Verifier，模型不能直接调用 GitLab 写接口。
 - 模型输出作为不可信文本进行 Markdown 转义，避免链接和 HTML 注入。

@@ -7,17 +7,17 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from mr_review_platform.errors import PlatformError
-from mr_review_platform.project_profile import PROFILE_POLICY_VERSION
+from mr_review_platform.project_profile import PROFILE_POLICY_VERSION, ProjectProfile
 from mr_review_platform.rule_catalog import RULE_CATALOG_VERSION, RULE_COMPILER_VERSION
 from mr_review_platform.syntax_analyzer import (
     SYNTAX_CATALOG_VERSION,
     SyntaxAnalyzerRegistry,
 )
 
-PLAN_VERSION = "m3.3-v1"
-PROMPT_VERSION = "m3.2.1-v1"
-VERIFIER_VERSION = "syntax-priority-v4"
-RESULT_SCHEMA_VERSION = "1"
+PLAN_VERSION = "m3.3.3-v1"
+PROMPT_VERSION = "m3.3.2-zh-v1"
+VERIFIER_VERSION = "convergence-aware-v7"
+RESULT_SCHEMA_VERSION = "2"
 
 
 class ReviewPlanError(PlatformError):
@@ -58,14 +58,24 @@ class SyntaxAnalyzerRef(BaseModel):
 class EffectiveReviewPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    plan_version: Literal["m3.3-v1"] = PLAN_VERSION
+    plan_version: Literal["m3.3-v1", "m3.3.1-v1", "m3.3.2-v1", "m3.3.3-v1"] = PLAN_VERSION
     config_version: int = Field(ge=1)
     review_enabled: bool
     review_strategy: Literal["diff_only", "simple_context"]
     prompt_profile: str = Field(min_length=1, max_length=64)
-    prompt_version: Literal["m3.2.1-v1"] = PROMPT_VERSION
-    verifier_version: Literal["syntax-priority-v4"] = VERIFIER_VERSION
-    result_schema_version: Literal["1"] = RESULT_SCHEMA_VERSION
+    prompt_version: Literal[
+        "m3.2.1-v1",
+        "m3.2.1-zh-v1",
+        "m3.3.1-zh-v1",
+        "m3.3.2-zh-v1",
+    ] = PROMPT_VERSION
+    verifier_version: Literal[
+        "syntax-priority-v4",
+        "syntax-priority-v5",
+        "history-aware-v6",
+        "convergence-aware-v7",
+    ] = VERIFIER_VERSION
+    result_schema_version: Literal["1", "2"] = RESULT_SCHEMA_VERSION
     rule_catalog_version: Literal["rule-catalog/v1"] = RULE_CATALOG_VERSION
     rule_compiler_version: Literal["rule-compiler/v1"] = RULE_COMPILER_VERSION
     syntax_catalog_version: Literal[SYNTAX_CATALOG_VERSION] = SYNTAX_CATALOG_VERSION
@@ -200,6 +210,25 @@ def build_effective_review_plan(
         )
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
         raise ReviewPlanError(f"effective review plan is invalid: {exc}") from exc
+
+
+def apply_repository_scope_overrides(
+    plan: EffectiveReviewPlan,
+    project_profile: ProjectProfile,
+) -> EffectiveReviewPlan:
+    """Resolve trusted repository scope values over platform defaults."""
+    scope = project_profile.review_scope
+    updates: dict[str, Any] = {}
+    if scope.supported_extensions is not None:
+        updates["supported_extensions"] = scope.supported_extensions
+    if scope.ignore_paths is not None:
+        updates["ignore_paths"] = scope.ignore_paths
+    if not updates:
+        return plan
+    try:
+        return EffectiveReviewPlan.model_validate({**plan.canonical_data(), **updates})
+    except ValidationError as exc:
+        raise ReviewPlanError(f"repository review scope override is invalid: {exc}") from exc
 
 
 def load_effective_review_plan(data: dict[str, Any], expected_hash: str) -> EffectiveReviewPlan:

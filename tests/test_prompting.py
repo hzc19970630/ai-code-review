@@ -12,7 +12,8 @@ from mr_review_platform.prompting import (
 from mr_review_platform.review_plan import build_effective_review_plan
 
 
-def _plan():
+def _plan(*, prompt_version: str | None = None):
+    version_options = {"prompt_version": prompt_version} if prompt_version is not None else {}
     return build_effective_review_plan(
         {
             "config_version": 1,
@@ -30,7 +31,8 @@ def _plan():
             "path_rules": {},
             "max_input_tokens": 8_000,
             "min_confidence": 70,
-        }
+        },
+        **version_options,
     )
 
 
@@ -106,6 +108,31 @@ def test_evidence_v2_policy_separates_location_from_literal_quote() -> None:
     assert 'not "main.tsx:1: export const s;"' in envelope.reviewer_policy
     assert "file_path" in envelope.reviewer_policy
     assert "line_start/line_end" in envelope.reviewer_policy
+
+
+def test_current_prompt_requires_simplified_chinese_user_facing_fields() -> None:
+    envelope = assemble_prompt_envelope(_plan(), {"changes": []})
+
+    assert envelope.prompt_version == "m3.3.2-zh-v1"
+    assert envelope.reviewer_policy_version == "reviewer-policy-v5"
+    assert "Simplified Chinese" in envelope.reviewer_policy
+    assert "Do not translate or alter source evidence" in envelope.reviewer_policy
+    assert "historical_assessments" in envelope.reviewer_policy
+
+
+def test_queued_legacy_prompt_keeps_its_original_reviewer_policy() -> None:
+    legacy_plan = _plan(prompt_version="m3.2.1-v1").model_copy(
+        update={
+            "plan_version": "m3.3.1-v1",
+            "result_schema_version": "1",
+            "verifier_version": "syntax-priority-v5",
+        }
+    )
+    envelope = assemble_prompt_envelope(legacy_plan, {"changes": []})
+
+    assert envelope.reviewer_policy_version == "reviewer-policy-v3"
+    assert "Simplified Chinese" not in envelope.reviewer_policy
+    assert "historical_assessments" not in envelope.output_schema["properties"]
 
 
 def test_input_estimate_covers_the_complete_canonical_request() -> None:

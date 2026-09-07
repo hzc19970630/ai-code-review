@@ -16,11 +16,17 @@ from sqlalchemy.orm import Session, selectinload
 
 from mr_review_platform.config import Settings, get_settings
 from mr_review_platform.db import Database
+from mr_review_platform.lineage import apply_lineage_lifecycle, ensure_active_lineage
 from mr_review_platform.logging import configure_logging
-from mr_review_platform.models import Finding, Project, ReviewJob, WebhookEvent
+from mr_review_platform.models import Finding, Project, ReviewJob, ReviewLineage, WebhookEvent
 from mr_review_platform.outbox import new_review_job_outbox_event
 from mr_review_platform.review_plan import build_effective_review_plan
-from mr_review_platform.schemas import FindingView, ProjectView, ReviewJobView
+from mr_review_platform.schemas import (
+    FindingView,
+    FullRescanRequest,
+    ProjectView,
+    ReviewJobView,
+)
 from mr_review_platform.secrets import SecretResolutionError, SecretResolver
 from mr_review_platform.services import project_config_snapshot
 from mr_review_platform.webhook import (
@@ -35,8 +41,25 @@ logger = logging.getLogger(__name__)
 def _review_job_view(job: ReviewJob) -> dict[str, object]:
     payload = ReviewJobView.model_validate(job).model_dump()
     manifest = job.context_manifest or {}
-    outcome = manifest.get("terminal_state") if isinstance(manifest, dict) else None
+    outcome = (
+        manifest.get("workset_coverage") or manifest.get("terminal_state")
+        if isinstance(manifest, dict)
+        else None
+    )
     payload["review_outcome"] = outcome if outcome in {"full", "partial", "none"} else None
+    payload["workset_coverage"] = payload["review_outcome"]
+    sufficiency = manifest.get("context_sufficiency") if isinstance(manifest, dict) else None
+    payload["context_sufficiency"] = (
+        sufficiency if sufficiency in {"sufficient", "limited"} else None
+    )
+    epoch = manifest.get("review_epoch") if isinstance(manifest, dict) else None
+    payload["review_epoch"] = epoch if isinstance(epoch, str) else None
+    baseline_status = manifest.get("baseline_status") if isinstance(manifest, dict) else None
+    payload["baseline_status"] = (
+        baseline_status
+        if baseline_status in {"building", "complete", "incomplete"}
+        else None
+    )
     return payload
 
 
@@ -203,6 +226,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 error_message=event.ignored_reason or "project review is disabled",
             )
             db.add(webhook_event)
+            apply_lineage_lifecycle(
+                db,
+                project_id=project.id,
+                mr_iid=event.mr_iid,
+                action=event.action,
+                state=event.state,
+                head_sha=event.head_sha,
+            )
             db.commit()
             return JSONResponse(
                 status_code=200,
@@ -211,6 +242,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         existing_job = db.scalar(select(ReviewJob).where(ReviewJob.dedupe_key == event.dedupe_key))
         if existing_job is not None:
+            ensure_active_lineage(
+                db,
+                project_id=project.id,
+                mr_iid=event.mr_iid,
+                source_branch=event.source_branch,
+                target_branch=event.target_branch,
+                head_sha=event.head_sha,
+            )
             db.add(
                 WebhookEvent(
                     project_id=project.id,
@@ -258,10 +297,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 default_llm_credential_ref=runtime_settings.llm_api_key_ref,
             )
             effective_plan = build_effective_review_plan(config_snapshot)
+            lineage = ensure_active_lineage(
+                db,
+                project_id=project.id,
+                mr_iid=event.mr_iid,
+                source_branch=event.source_branch,
+                target_branch=event.target_branch,
+                head_sha=event.head_sha,
+            )
+            parent_review_job_id = db.scalar(
+                select(ReviewJob.id)
+                .where(
+                    ReviewJob.review_lineage_id == lineage.id,
+                    ReviewJob.status == "succeeded",
+                    ReviewJob.head_sha != event.head_sha,
+                )
+                .order_by(ReviewJob.created_at.desc(), ReviewJob.id.desc())
+                .limit(1)
+            )
             review_job = ReviewJob(
                 project_id=project.id,
                 webhook_event_id=webhook_event.id,
                 trigger_type="webhook",
+                parent_review_job_id=parent_review_job_id,
+                review_lineage_id=lineage.id,
                 provider_project_id=event.provider_project_id,
                 mr_iid=event.mr_iid,
                 mr_title=event.title,
@@ -279,7 +338,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 config_snapshot=config_snapshot,
                 effective_plan=effective_plan.canonical_data(),
                 plan_hash=effective_plan.plan_hash,
-                max_attempts=runtime_settings.review_max_attempts,
+                max_attempts=runtime_settings.review_max_attempts + effective_plan.max_batches,
             )
             db.add(review_job)
             db.flush()
@@ -370,12 +429,111 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "findings": [FindingView.model_validate(item).model_dump() for item in findings],
         }
 
+    @app.post(
+        "/api/reviews/{review_id}/rescan",
+        dependencies=[Depends(require_api_token)],
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def rescan_review(
+        review_id: int,
+        request: FullRescanRequest | None = None,
+        db: Session = Depends(get_db),
+    ) -> dict[str, object]:
+        source = db.get(ReviewJob, review_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="review job was not found")
+        if source.status not in {"succeeded", "failed", "skipped"}:
+            raise HTTPException(status_code=409, detail="review job is not terminal")
+        project = db.scalar(
+            select(Project)
+            .options(selectinload(Project.config))
+            .where(Project.id == source.project_id)
+        )
+        if project is None or project.config is None or not project.enabled:
+            raise HTTPException(status_code=409, detail="review project is not enabled")
+
+        nonce = uuid.uuid4().hex
+        snapshot = project_config_snapshot(
+            project.config,
+            default_llm_model=runtime_settings.llm_model,
+            default_llm_credential_ref=runtime_settings.llm_api_key_ref,
+        )
+        snapshot["review_epoch_nonce"] = nonce
+        snapshot["review_epoch_reason"] = request.reason if request is not None else None
+        effective_plan = build_effective_review_plan(snapshot)
+        preserve_lineage = request is None or request.preserve_lineage
+        snapshot["review_lineage_reset"] = not preserve_lineage
+        if preserve_lineage:
+            if source.review_lineage_id is not None:
+                lineage = db.get(ReviewLineage, source.review_lineage_id)
+            else:
+                lineage = ensure_active_lineage(
+                    db,
+                    project_id=source.project_id,
+                    mr_iid=source.mr_iid,
+                    source_branch=source.source_branch,
+                    target_branch=source.target_branch,
+                    head_sha=source.head_sha,
+                )
+            if lineage is None:
+                raise HTTPException(status_code=409, detail="review lineage was not found")
+            lineage.status = "active"
+            lineage.current_mr_iid = source.mr_iid
+            lineage.latest_observed_head_sha = source.head_sha
+            lineage.dormant_at = None
+            lineage.version += 1
+        else:
+            lineage = ReviewLineage(
+                project_id=source.project_id,
+                source_branch=source.source_branch,
+                target_branch=source.target_branch,
+                current_mr_iid=source.mr_iid,
+                status="active",
+                latest_observed_head_sha=source.head_sha,
+                version=1,
+            )
+            db.add(lineage)
+            db.flush()
+        job = ReviewJob(
+            project_id=source.project_id,
+            trigger_type="full_rescan",
+            parent_review_job_id=None,
+            review_lineage_id=lineage.id,
+            provider_project_id=source.provider_project_id,
+            mr_iid=source.mr_iid,
+            mr_title=source.mr_title,
+            mr_url=source.mr_url,
+            source_branch=source.source_branch,
+            target_branch=source.target_branch,
+            head_sha=source.head_sha,
+            author_username=source.author_username,
+            status="queued",
+            dedupe_key=f"full-rescan:{source.id}:{nonce}",
+            review_strategy=effective_plan.review_strategy,
+            prompt_profile=effective_plan.prompt_profile,
+            prompt_version=effective_plan.prompt_version,
+            result_schema_version=effective_plan.result_schema_version,
+            config_snapshot=snapshot,
+            effective_plan=effective_plan.canonical_data(),
+            plan_hash=effective_plan.plan_hash,
+            max_attempts=runtime_settings.review_max_attempts
+            + effective_plan.max_batches,
+        )
+        db.add(job)
+        db.flush()
+        db.add(new_review_job_outbox_event(job, available_at=datetime.now(UTC)))
+        db.commit()
+        db.refresh(job)
+        return {"status": "accepted", "review_job_id": job.id, "review_epoch_reset": True}
+
     @app.get("/api/findings", dependencies=[Depends(require_api_token)])
     def list_findings(
         project_id: int | None = None,
         review_job_id: int | None = None,
         severity: str | None = None,
         validation_status: str | None = None,
+        origin_scope: str | None = None,
+        publication_status: str | None = None,
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=20, ge=1, le=100),
         db: Session = Depends(get_db),
@@ -389,6 +547,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             filters.append(Finding.severity == severity)
         if validation_status:
             filters.append(Finding.validation_status == validation_status)
+        if origin_scope:
+            filters.append(Finding.origin_scope == origin_scope)
+        if publication_status:
+            filters.append(Finding.publication_status == publication_status)
         total = db.scalar(select(func.count()).select_from(Finding).where(*filters)) or 0
         findings = db.scalars(
             select(Finding)

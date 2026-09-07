@@ -10,7 +10,7 @@
 - 基于变更构建有限且相关的代码上下文
 - 模型输出结构化问题
 - 确定性 Verifier 过滤无效结果
-- Finding 持久化和生命周期管理
+- Finding 不可变审计和评审谱系内的当前状态管理
 - 幂等回写 GitLab MR
 - Dashboard 查询、反馈和质量度量
 
@@ -54,6 +54,14 @@ ReviewMergeRequestUseCase
 - 代码和模型上下文默认不写普通日志。
 - Agent 默认无网络、只读仓库、禁止执行仓库脚本。
 
+### 2.6 问题治理边界
+
+- 平台负责同一 `ReviewLineage` 内已验证问题的持续状态，防止模型漂移和 MR 重建导致问题消失。
+- `Finding` 是单次 ReviewJob 的不可变 Occurrence；`LineageFindingState` 是谱系内当前投影，两者不能合并为可变全局 Finding。
+- MR Note 是面向开发者的展示投影，不是问题状态事实源。旧 MR 关闭后冻结，新 MR 只有安全关联到同一 Lineage 才接续当前问题。
+- 不同 Lineage 修改同一文件或重叠代码时保持独立。仓库级相似问题只能用于只读统计，不参与自动继承、解决和发布。
+- 平台不替代 GitLab Issue、Jira 或 SAST，不承担负责人、排期、SLA 和全仓缺陷处置。
+
 ## 3. 总体架构
 
 ```text
@@ -89,7 +97,9 @@ GitLab MR Webhook ------>| API Service       |
              |                     |
              +----------+----------+
                         v
-                  Finding Store
+             Finding Occurrence Store
+                        |
+              Review Lineage Projection
                         |
               Markdown/Note Writer
                         |
@@ -122,6 +132,7 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 | `context` | diff 解析、文件选择、Token 预算 | 模型调用和结果存储 |
 | `analyzers` | 固定版本的只读语法解析器注册、诊断标准化和资源限制 | 执行仓库脚本、安装项目依赖、跨文件构建和发布决策 |
 | `review` | Review 编排、Schema、Verifier、渲染 | HTTP 路由和 GitLab SDK |
+| `lineage` | 谱系识别、严格跨 MR 关联、Finding 当前状态投影和并发版本检查 | 仓库级相似问题合并、Issue/Jira 工作流、模型语义猜测关联 |
 | `rules` | 全局、项目和路径规则匹配 | 数据持久化 |
 | `llm` | Provider 适配、超时、用量采集 | 业务严重级别决策 |
 | `notification` | 结构化 Review 通知事件、渠道路由和 Feishu 适配器 | 评审决策、源码读取和 GitLab Note 状态 |
@@ -135,7 +146,7 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 1. 检查请求大小、Content-Type 和 `X-Gitlab-Event`。
 2. 通过 `provider_project_id` 定位 Project。
 3. 使用项目 Webhook Secret 做常量时间校验。
-4. 标准化 `mr_iid/base_sha/start_sha/head_sha/action`。
+4. 标准化 `mr_iid/base_sha/start_sha/head_sha/action`；M3.3.4 起 `close/merge/reopen` 同时推进 ReviewLineage 状态，但 close/merge 不创建 LLM 评审任务。
 5. 保存脱敏后的 `webhook_events`。
 6. 在同一数据库事务中按 `dedupe_key` 创建 ReviewJob 和唯一 OutboxEvent。
 7. Dispatcher 通过数据库锁领取 OutboxEvent，并在 Redis 短时原子锁内发送 `review_job_id`。
@@ -147,18 +158,41 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 
 1. Worker 以条件更新将任务从 `queued` 变为 `running`。
 2. 加载任务创建时冻结的 `effective_plan` 并校验 `plan_hash`；历史任务只允许从自身 `config_snapshot` 一次性补建。
-3. GitLab Adapter 拉取 MR 元数据和 diff；ProjectProfiler 在可信目标提交上精确读取 `.ai-review.yml` 和声明的规范文件，同时只用最多 500 个 Repository Tree blob 做可选画像推断。配置声明的关键/companion 路径可绕过 Tree 样本进入候选，选中后才从冻结的 MR Head 延迟读取。
-4. Context Builder 在文件数、字符和 Token 硬预算内构建 ContextPack；任务级内存缓存只去重本次 GitLab 文件请求，不持久化 Git 仓库。
-5. Rule Compiler 按固定 Catalog 匹配通用、项目和路径级规则，并把编译结果及 Hash 冻结到本次评审输入。
-6. SyntaxAnalyzerRegistry 对 ContextManifest 中的可分析文件调用固定版本 Adapter，产生可复现的语法 Finding 或稳定的跳过/失败 reason code。
-7. Batch Planner 按稳定风险与路径顺序形成有限批次；文件在批次成功前保持 `pending`，预算耗尽或失败时保留稳定原因。
-8. Review Engine 调用模型生成结构化结果；已覆盖语法的文件通过 `do_not_report` 约束避免重复判断，每次真实 HTTP 尝试独立审计。
-9. Verifier 按 EffectiveReviewPlan 中的 `verifier_version` 使用新增行映射校验文件、行号和 literal Evidence；有限 Normalizer 只处理合法定位包装，拒绝项保存稳定 `validation_code` 且不进入发布结果。
-10. Aggregator 合并 Analyzer 与 LLM Finding，按确定性来源优先级、Verifier、Fingerprint 去重和 Coverage 汇总，不重新生成问题。
-11. 所有批次结束后仅一次保存 Findings、ContextManifest 和 ReviewJob 结果。
-12. Markdown Renderer 从 Findings 生成汇总评论。
-13. `shadow` 模式直接完成任务；`publish` 模式再次读取 MR Head，未变化时 Comment Writer 才创建或更新 GitLab Note，并保存 Note ID。
-14. M5 以后由结果事务产生结构化通知事件，Notification Dispatcher 按渠道投递；通知失败不回滚评审结果。
+3. GitLab Adapter 拉取 MR 元数据和 diff；ProjectProfiler 在可信目标提交上精确读取 `.ai-review.yml` 和声明的规范文件，同时只用最多 500 个 Repository Tree blob 做可选画像推断。配置声明的关键/companion 路径可绕过 Tree 样本进入候选，选中后才从冻结的 MR Head 延迟读取。仓库可分别覆盖平台默认的 `supported_extensions` 与 `ignore_paths`；Worker 将解析后的覆盖值和 ProjectProfile 原子冻结为最终 Effective Plan 后再构建 Context。
+4. M3.3.4 解析 ReviewLineage：同一 MR 沿用原谱系；重建 MR 只从关闭未合并的 dormant 候选中选择，并且项目、分支、替代窗口、基线和评审语义兼容，GitLab Compare 完整证明 Head 相同或连续且候选唯一时才关联。若存在谱系上一成功 Head，History Review 根据文件、Rule Hash 和关联依赖哈希确定性延续未变化 Finding，变化项进入定向复核。
+5. Context Builder 构建完整 eligible workset；超长 unified diff 按 hunk/行边界形成稳定 Segment，不在 Batch 前静默截断。任务级内存缓存只去重本次 GitLab 文件请求，不持久化 Git 仓库。
+6. Rule Compiler 按固定 Catalog 匹配通用、项目和路径级规则，并把编译结果及 Hash 冻结到本次评审输入。
+7. SyntaxAnalyzerRegistry 对 ContextManifest 中的可分析文件调用固定版本 Adapter，产生可复现的语法 Finding 或稳定的跳过/失败 reason code。
+8. Batch Planner 按稳定风险、路径和 Segment 顺序形成有限批次，并生成路径相关的 ProfileSlice；同一文件可跨批，只有全部 Segment 成功才计入 reviewed。
+9. Review Engine 调用模型生成结构化结果和变化历史 Finding 的状态；已覆盖语法的文件通过 `do_not_report` 约束避免重复判断，每次真实 HTTP 尝试独立审计。
+10. Verifier 按 EffectiveReviewPlan 中的 `verifier_version` 使用新增行映射校验文件、行号和 literal Evidence；有限 Normalizer 只处理合法定位包装，拒绝项保存稳定 `validation_code` 且不进入发布结果。
+11. Aggregator 合并 Analyzer、历史延续与 LLM Finding，按确定性来源优先级、Verifier、Fingerprint 去重和双维 Coverage 汇总，不重新生成问题。
+12. 所有批次结束后重新读取 MR Head；无论 `shadow` 还是 `publish`，Head 已变化时只保存 stale 审计结果，不推进 LineageFindingState。
+13. Head 未变化时仅一次保存 Finding Occurrence、ContextManifest v8 Provenance/Transition 和 ReviewJob 结果；M3.3.4 在同一事务中按 Lineage 当前 Head/版本条件推进 LineageFindingState，旧 Worker 不得覆盖新状态。
+14. Markdown Renderer 根据当前任务和账本投影分区展示仍存在、本次新发现、已解决和无法确认的问题。
+15. `shadow` 模式直接完成任务；`publish` 模式由 Comment Writer 创建或更新 GitLab Note，并保存 Note ID。Note 只是账本投影；发送失败保留 ReviewJob 发布重试状态，不回滚账本。
+16. M5 以后由结果事务产生结构化通知事件，Notification Dispatcher 按渠道投递；通知失败不回滚评审结果。
+
+### 6.3 ReviewLineage 与问题状态
+
+```text
+Project 1 --- N ReviewLineage
+ReviewLineage 1 --- N ReviewJob
+ReviewJob 1 --- N Finding
+ReviewLineage 1 --- N LineageFindingState
+```
+
+最小持久化模型：
+
+| 对象 | 关键字段 | 一致性规则 |
+|---|---|---|
+| `review_lineages` | `project_id`、源/目标分支、最近 Head、`active/dormant/completed`、版本 | 分支名不是唯一键；严格验证后才能跨 MR 关联 |
+| `review_jobs.review_lineage_id` | 当前任务所属谱系 | 历史数据允许为空，迁移后新 eligible 任务必须确定归属 |
+| `lineage_finding_states` | `lineage_id + fingerprint`、当前状态、Evidence/Provenance、首次/最近 Job 和 Head | 组合唯一；只由评审完整、非 stale 且最终 Head 校验通过的任务推进 |
+
+跨 MR 自动关联必须同时满足：同项目、旧 MR 关闭未合并且处于有限替代窗口、源/目标分支一致、Review Epoch 语义兼容、目标基线兼容，且 Compare 完整证明 Head 相同或新 Head 为后继。多个候选或任一条件无法证明时创建新 Lineage。M3.3.4 的 Review Epoch 使用 Lineage 而非 MR IID 作为身份。文件路径、行号、标题相似度、分支名或 LLM 判断均不能单独建立关联。
+
+两个独立 Lineage 可以在同一路径、相同行范围保存相同 Fingerprint 的独立状态。未来仓库级 Correlation 只能是只读派生数据，不能修改 LineageFindingState。
 
 ## 7. 配置优先级
 

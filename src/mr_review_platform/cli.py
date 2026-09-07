@@ -35,6 +35,8 @@ def _parser() -> argparse.ArgumentParser:
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("--dataset", required=True)
     evaluate.add_argument("--predictions")
+    convergence = sub.add_parser("evaluate-convergence")
+    convergence.add_argument("--sequence", required=True)
     preview = sub.add_parser("rules-preview")
     preview.add_argument("--file", action="append", required=True)
     preview.add_argument(
@@ -106,6 +108,16 @@ def main() -> None:
             print(report_json(evaluate_dataset(dataset, load_predictions(args.predictions))))
         else:
             print(json.dumps(dataset_summary(dataset), ensure_ascii=False, indent=2))
+        return
+    if args.command == "evaluate-convergence":
+        from mr_review_platform.evaluation import (
+            evaluate_convergence,
+            load_convergence_sequence,
+            report_json,
+        )
+
+        sequence = load_convergence_sequence(args.sequence)
+        print(report_json(evaluate_convergence(sequence)))
         return
     if args.command == "rules-preview":
         from mr_review_platform.project_profile import ProjectProfile
