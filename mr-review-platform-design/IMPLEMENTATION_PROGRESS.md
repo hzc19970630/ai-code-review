@@ -1,7 +1,8 @@
 # AI Code Review 平台总设计方案实施进度
 
-> 统计日期：2026-08-24
-> 当前阶段：M3.0 至 M3.3.4 运行代码与自动化门禁完成；M3 整体质量和真实重建 MR 验收待补
+> 统计日期：2026-08-24（样本计数口径）
+> 最近真实验收：2026-11-06（`seakoi/design` 相同 Head 重建零 LLM 继承、已发布 Finding 延续）
+> 当前阶段：M3.0 至 M3.3.4 运行代码与自动化门禁完成；M3.3.4 真实验收已部分完成，M3 整体质量验收待补
 > 事实来源：当前代码、自动化测试、本地 Docker 运行态、PostgreSQL 记录和已完成的真实 GitLab MR 验证
 
 ## 1. 总体结论
@@ -10,7 +11,7 @@
 
 当前不能将 M3 标记为整体完成。尚缺少 50 个 Golden MR、两个真实项目的系统化 Shadow 试点、质量阈值裁决和中文输出的真实新 MR 验收。项目应继续停留在“M3 退出门禁”，不应直接进入大规模发布、Dashboard 或合并阻断建设。
 
-最新增强已经实现并重建到本地 API/Worker 运行链路；当前尚未提交 Git：
+最新增强已经实现并重建到本地 API/Worker 运行链路，并已随 `b2c8303 feat: m4升级` 提交（该提交信息写作 m4升级，实际内容为 M3.3.x，M4 主体尚未开始）：
 
 1. 平台 `project_configs` 提供默认 `supported_extensions`/`ignore_paths`，可信目标分支 `.ai-review.yml` 可分别整体覆盖。
 2. 新任务使用 `m3.3.2-zh-v1`，评审自然语言、语法 Finding、GitLab Note 标题和 Coverage 文案统一为简体中文；英文模型结果会进入一次有预算、有审计的 Repair。
@@ -20,7 +21,7 @@
 6. M3.3.3 已增加同一 ReviewJob 的 Batch 检查点续跑、Finding 来源/发布状态、Review Epoch、人工全量重扫 API 和连续 Head 收敛评测。
 7. 已补充升级兼容：M3.3.3 的执行版本变化不会自动切断 M3.3.2 的历史 Finding；只有评审语义或目标基线变化才开启新 Epoch。
 8. Manifest v8 已增加空 Head Delta 快路径：完整零文件 Compare 可确定性延续父任务结果且不创建 LLMRun；不完整基线、待复核历史问题、Compare 不可用和人工 Full Rescan 均不快跳。
-9. M3.3.4 已实现 `ReviewLineage + LineageFindingState`：close/merge/reopen 推进谱系生命周期；重建 MR 只有通过唯一 dormant 候选、替代窗口、基线、评审语义和 GitLab Compare 完整校验才继承；账本使用 Head/版本条件更新防止旧 Worker 覆盖新状态。自动化已覆盖相同 Head 零 LLM 继承、后继/分叉、候选歧义、交叉 Lineage 隔离和乱序保护，真实 GitLab 重建 MR 仍待验收。
+9. M3.3.4 已实现 `ReviewLineage + LineageFindingState`：close/merge/reopen 推进谱系生命周期；重建 MR 只有通过唯一 dormant 候选、替代窗口、基线、评审语义和 GitLab Compare 完整校验才继承；账本使用 Head/版本条件更新防止旧 Worker 覆盖新状态。自动化已覆盖相同 Head 零 LLM 继承、后继/分叉、候选歧义、交叉 Lineage 隔离和乱序保护；真实 GitLab 重建 MR 已于 2026-11-06 验收「相同 Head 零 LLM 继承」与「已发布 Finding 延续」两项，修复后 resolved、新问题新增、分叉/歧义诊断和乱序 Push 仍待现场复验。
 
 ## 2. 当前运行架构
 
@@ -72,9 +73,9 @@ Read API：查询项目、ReviewJob、ContextManifest 和 Finding
 | M3.2.1 语法分析 | 功能已实现，TS Shadow Fixture 已验证 | TS/TSX、Python 3.12、JSON、YAML 固定分析器，稳定诊断和去重 | 多语言真实 MR 样本和失败注入复验 |
 | M3.3 大 MR | 运行代码完成，质量验收待补 | 稳定批次、总预算、部分失败、逐调用审计、聚合、Coverage | 50 个 Golden MR、两个项目 Shadow和质量阈值 |
 | M3.3.1 超长 Diff | 功能已实现，真实 MR 验收待补 | hunk/行分段、稳定 Segment、跨批文件聚合、精确 partial Coverage | 后半段缺陷真实 MR、预算耗尽和中间分段失败现场复验 |
-| M3.3.2 跨 Head 一致性 | 功能已实现，真实连续 Head 验收待补 | 父任务谱系、Compare Delta、历史 Finding Transition、ProfileSlice、双维 Coverage | 旧问题保持、修复后 resolved、新问题新增、Compare 退化真实 Shadow |
+| M3.3.2 跨 Head 一致性 | 功能已实现，真实连续 Head 验收部分完成 | 父任务谱系、Compare Delta、历史 Finding Transition、ProfileSlice、双维 Coverage，以及 2026-11-06 真实零变更 Head 下旧问题确定性保持 | 修复后 resolved、新问题新增、Compare 退化真实 Shadow |
 | M3.3.3 收敛控制 | 功能已实现，真实连续 Head 验收待补 | Batch 续跑、来源分类、发布边界、Review Epoch、全量重扫、收敛评测 | 大 MR 续跑、Shadow 候选、Epoch 重置和 no-op 收敛真实验收 |
-| M3.3.4 评审谱系账本 | 功能已实现，真实验收待补 | ReviewLineage、状态账本、生命周期、严格关联、迁移回填、并发保护、跨 MR 投影和自动化门禁 | 真实 GitLab 相同 Head/后继 Head 重建 MR、分叉与歧义诊断验收 |
+| M3.3.4 评审谱系账本 | 功能已实现，真实验收部分完成 | ReviewLineage、状态账本、生命周期、严格关联、迁移回填、并发保护、跨 MR 投影、自动化门禁，以及 2026-11-06 真实 GitLab 相同 Head 零 LLM 继承与已发布 Finding 延续 | resolved 与新问题新增流转、分叉 Head/候选歧义/目标基线变化不继承、乱序 Push 现场验收 |
 | M4 可观测试点 | 部分基础存在，主体规划中 | 只读项目/Review/Finding API、日志、健康检查 | 稳定 Read Model、指标、Trace、告警、最小 Dashboard、14 天试点 |
 | M5 反馈与企业治理 | 规划中 | 仅设计完成 | Feedback/Audit、配置发布回滚、OIDC/RBAC、飞书机器人、备份治理 |
 | M6 高级评审 | 条件规划 | 无 | 行级 Discussion、Symbol 索引、Agent、Commit Status、合并门禁 |
@@ -208,8 +209,24 @@ MR `!327` 的最新有效 Job：
 | P1 | M3.3.4 真实 GitLab 重建 MR 尚未验收 | 自动化已通过，但尚缺 Provider 现场证据 | 验证相同 Head、后继 Head、分叉/歧义和乱序 Push 场景 |
 | P1 | 大 MR 最多 4 Batch | 本次 43 个 eligible 文件未语义评审 | 先用质量/成本数据调整，不直接无限增批 |
 | P1 | ProjectProfile 总预算 16,000 字符 | 大配置文件可能被截断 | 结构化提取 Manifest 事实，避免简单扩容 |
+| P1 | 跨 Attempt 输入预算单位错配 | 已用额度取 `llm_runs.prompt_tokens`（网关真实值），预留取 `bytes/4` 估算值，实测中文 TSX 批次低估约 3.7 倍；单次整单重试即可触发 `BATCH_TOTAL_INPUT_BUDGET`，Job 以 `succeeded` 加零批次覆盖结束 | 预约与记账统一到同一单位，或按 Attempt 重置总预算；现场判定前先按 `job_attempt_no` 分组核对 |
+| P1 | 被拒绝的 LLM 原始输出未落库 | `LLM_OUTPUT_INVALID` 只留下 Job 重试记录，无法复核模型实际返回了什么、违反了哪个 schema 字段 | 在 M4.0 之前先持久化裁剪后的失败输出与校验违规项，Repair 率才可度量 |
 | P1 | 生产治理未完成 | 不具备正式生产发布条件 | CI、内部 CA、备份恢复、SBOM、回滚手册 |
 | P2 | Read Model/指标/Trace 不完整 | 运营诊断依赖 SQL 和日志 | M4.0/M4.1 建设稳定查询契约和指标 |
+
+**2026-11-06 预算缓解（未修复上述两项）**：`seakoi/design`（project 1）`project_configs.max_input_tokens` 由
+30000 调到 60000，按 `max_input_tokens x max_batches(4)` 推导，总输入预算 120000 升到 240000，刚好容纳一次整单
+重试；`ai-review-test`（project 2，Shadow）保持 30000。无需重启，Webhook 每次事件实时取配置快照；
+`review_semantics_hash` 不含预算字段，既有 Lineage 继承不受影响。
+
+下一个真实 MR 的只读验收口径：
+
+1. `review_jobs.effective_plan->>'max_total_input_tokens'` 应为 240000，否则说明该 Job 建在配置变更之前。
+2. 若仍出现 `BATCH_TOTAL_INPUT_BUDGET`，按 `llm_runs.job_attempt_no` 分组对比 `sum(prompt_tokens)` 与预算，
+   并回看上一 Attempt 的 `error_code`；预算跳过通常是根因的二次症状，不得直接写成「MR 过大」。
+3. 单批次估算接近 60000 时真实 Token 可能达到约 20 万，若撞上下文上限会以 `LLM_REQUEST_ERROR`/批次失败显式暴露，
+   不再静默 `succeeded`；记录出现过的最大 `prompt_tokens` 作为容量口径。
+4. 复核同一 Job 是否再次出现 `LLM_OUTPUT_INVALID`，并确认被拒绝的原始输出仍无处可查。
 
 ## 8. 下一阶段执行顺序
 
@@ -223,10 +240,10 @@ MR `!327` 的最新有效 Job：
 
 ### 发布门禁 B：完成 M3.3.4 真实验收
 
-迁移、生命周期、严格关联、状态投影和自动化并发门禁已经完成。剩余现场验收：
+迁移、生命周期、严格关联、状态投影和自动化并发门禁已经完成。现场验收进度（2026-11-06 更新）：
 
-1. 关闭一个未合并且存在 open Finding 的旧 MR，确认升级后的 close Webhook 已将 Lineage 置为 dormant；再在 7 天窗口内以相同 Head 重建 MR，确认沿用 Lineage、零额外 LLM 调用并在新 Note 投影旧问题。迁移不会查询 GitLab，升级前已关闭但未收到新 close 事件的历史 Lineage 不参与该验收。
-2. 在重建 MR 推送后继 Head，确认未修改问题保持、真实修复进入 resolved、新引入问题正常新增。
+1. 已验收：关闭存在 open Finding 且未合并的旧 MR 后，close Webhook 处理完即把 Lineage 置为 dormant（实测 6 秒内可观测）；在 7 天窗口内以相同 Head 重建 MR，确认沿用原 Lineage、`llm_runs` 零新增、已发布 Finding 以 `carry-forward` 投影到新 Note，账本 `latest_review_job_id` 前进到新 Job。迁移不会查询 GitLab，升级前已关闭但未收到新 close 事件的历史 Lineage 不参与该验收。
+2. 部分完成：「未修改问题保持」已在相同 Head 重建场景验证，账本 `transition_reason=HISTORY_DEPENDENCIES_UNCHANGED`；「真实修复进入 resolved」和「新引入问题正常新增」仍需在推送修复 Head 后复验。
 3. 用分叉 Head、多个 dormant 候选或目标基线变化验证不继承，并检查 Manifest 中的稳定解析原因。
 4. 快速连续 Push 验证最终账本 Head 等于 GitLab 当前 Head；旧任务、部分覆盖、stale Head 和 Note 发布失败均不得误删或串改当前状态。
 
@@ -249,5 +266,5 @@ MR `!327` 的最新有效 Job：
 
 - 可以继续：本地开发、受控测试项目、Shadow 和非阻断汇总评论。
 - 暂不建议：扩大到大量项目、启用合并阻断、默认执行 Agent、建设复杂 Dashboard 或引入全仓缓存。
-- M3 退出判定：M3.0 至 M3.3.4 代码与自动化门禁完成；M3.3.4 真实场景和 M3 整体系统质量验收待补。
-- Git 状态：提交基线为 `5301293 feat: M3完成`；本文涉及的仓库范围覆盖和中文输出仍在工作区，提交前不能视为正式可追溯发布版本。
+- M3 退出判定：M3.0 至 M3.3.4 代码与自动化门禁完成；M3.3.4 真实验收已关闭相同 Head 继承与已发布 Finding 延续两项，resolved/新问题新增、分叉与歧义不继承、乱序 Push 仍待补，M3 整体系统质量验收待补。
+- Git 状态：提交基线为 `b2c8303 feat: m4升级`（提交信息写作 m4升级，实际内容为 M3.3.x，M4 主体未实现）；仓库范围覆盖与中文输出已随该提交进入版本库，本文件 2026-11-06 的真实验收记录和预算缓解说明仍在工作区未提交。
