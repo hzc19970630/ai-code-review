@@ -488,16 +488,16 @@ Verifier 判定顺序：
 
 有界仓库读取策略：
 
-1. Worker 先在可信目标提交上按固定路径精确读取根目录 `.ai-review.yml`；是否命中不依赖 Repository Tree 的返回顺序。文件不存在表示该目标提交尚未配置，不记作拉取失败；MR 首次新增该文件时，本次仍使用旧目标提交的配置，合并后的新 MR 才生效。
-2. GitLab Repository Tree 只承担低成本项目事实发现，递归结果最多接受 500 个 blob 路径。超过上限记录 `PROFILE_TREE_TRUNCATED`，不得通过持续翻页建立隐式全仓索引。
-3. 配置中的 `standards` 在路径归一化、扩展名和白名单 Schema 校验后，从同一可信目标提交按精确路径读取，不要求路径先出现在前 500 个 Tree blob 中。声明文件不存在记录 `PROFILE_DECLARED_PATH_NOT_FOUND`，与 Schema 非法分开诊断。
-4. 配置明确声明的 `key_paths` 和匹配当前变更的 `companion_patterns.paths` 直接进入确定性关联候选；选中后才从 MR Head 延迟读取，不要求先出现在 Tree 样本中。未选中的声明路径不下载内容。由 Manifest 自动推断的公共导出入口仍需 Tree 路径证据，避免把模块名推导误当成真实文件。
-5. 精确读取和 Tree 推断共用硬预算：ProjectProfile 最多尝试 24 个文件、单文件最多 8,000 字符、单个规范最多使用 4,000 字符、总画像最多 16,000 字符；显式配置和规范优先于可选推断文件。关联上下文继续受最多 8 个文件和 Context/Batch Token 预算限制。
+1. Worker 先在可信目标提交上按固定路径精确读取根目录 `.ai-review.yml`；文件不存在表示该目标提交尚未配置，不记作拉取失败；MR 首次新增该文件时，本次仍使用旧目标提交的配置，合并后的新 MR 才生效。
+2. ProjectProfile 不扫描递归 Repository Tree。Worker 通过固定 `.ai-review.yml`、根/工作区 manifest（`_PROFILE_FILES` 白名单）、`package.json` workspaces、`pnpm-workspace.yaml`、pnpm/npm lockfile importers、`go.work`、`Cargo.toml` members、`pyproject.toml` workspace members 和 Gradle includes 做精确路径发现；发现探测最多 64 次。无法从 lockfile/声明解析的 workspace glob 记录 `PROFILE_DISCOVERY_PARTIAL`，不回退到全仓 listing。
+3. 配置中的 `standards` 在路径归一化、扩展名和白名单 Schema 校验后，从同一可信目标提交按精确路径读取，不依赖任何 Tree 样本。声明文件不存在记录 `PROFILE_DECLARED_PATH_NOT_FOUND`，与 Schema 非法分开诊断。
+4. 配置明确声明的 `key_paths` 和匹配当前变更的 `companion_patterns.paths` 直接进入确定性关联候选；选中后才从 MR Head 延迟读取。未选中的声明路径不下载内容。由 Manifest 自动推断的公共导出入口用有界 `get_file` 探测验证存在性，避免把模块名推导或构建产物误当成真实文件。
+5. 精确发现和画像读取共用硬预算：ProjectProfile 最多尝试 24 个文件、单文件最多 8,000 字符、单个规范最多使用 4,000 字符、总画像最多 16,000 字符；显式配置和规范优先于可选推断文件。关联上下文继续受最多 8 个文件和 Context/Batch Token 预算限制。
 6. M3 继续使用 GitLab API 和 ReviewJob 进程内短期文件缓存，不执行 `git clone`，不持久化 Git 仓库，不新增仓库缓存卷、清理任务或项目级 Git 锁。只有真实数据证明 API 路径发现不足且 M3 质量门禁完成后，才评估 `--filter=blob:none` 的本地 Git 索引方案。
 
 预算和 Coverage 语义必须分开：
 
-- `PROFILE_TREE_TRUNCATED` 只表示自动发现样本不完整，不等于变更文件未审查；`.ai-review.yml`、变更文件和显式声明路径仍按精确路径读取。
+- `PROFILE_DISCOVERY_PARTIAL` 只表示 workspace/自动发现不完整，不等于变更文件未审查；`.ai-review.yml`、变更文件和显式声明路径仍按精确路径读取。
 - `PROFILE_TOTAL_BUDGET` 只表示画像候选没有全部进入结构化画像，不应单独把 eligible 文件 Coverage 降为 partial。只有当前批次所需的规范或关联文件没有取得时，才降低上下文充分度。
 - M3.3.2 将 Coverage 拆成 `workset_coverage` 和 `context_sufficiency`。前者回答“代码是否进入并成功完成评审”，后者回答“得出语义结论所需的项目规范和关联上下文是否充分”。
 - ProjectProfile 在 Prompt 中按批次生成相关切片：始终保留语言、框架、Workspace、有效规则和来源哈希，只携带匹配当前路径的规范、关键入口和 companion 信息。不得为每个批次重复注入全部画像文本。
@@ -518,7 +518,7 @@ Verifier 判定顺序：
 
 - 至少用 4 类 Fixture 项目验证单仓、多包、前后端混合和后端服务布局。
 - Profile 大小、文件数量和单文件长度均有硬上限。
-- 超过 500 个 blob 的 Fixture 中，可信目标提交的 `.ai-review.yml`、规范文件和匹配的关联路径仍能命中，同时 Tree 枚举和显式读取各自不突破预算。
+- 超过 500 条路径的 Fixture 中，不调用 Repository Tree；可信目标提交的 `.ai-review.yml`、规范文件和匹配的关联路径仍能精确命中，显式读取不突破预算。
 - Profile 缺失不会静默伪造成已理解项目，GitLab Coverage 明确显示降级。
 - 恶意 MR 修改配置或规范文件不能改变本次有效规则和 Prompt。
 
@@ -728,7 +728,7 @@ Finding 延续首版不新增历史表，以下描述是 M3.3.2 已实现基线�
 
 定向上下文与预算策略：
 
-1. 历史 Finding 文件、本次 Delta 文件和 `.ai-review.yml` 声明路径均按精确路径读取，不依赖前 500 个 Repository Tree blob。
+1. 历史 Finding 文件、本次 Delta 文件和 `.ai-review.yml` 声明路径均按精确路径读取，不依赖 Repository Tree 样本。
 2. 相关文件优先级固定为：匹配的 `companion_patterns`、当前变更的直接 import、同目录或同名测试、公共 API 入口、一般 `key_paths`。首版只解析一跳直接 import，并与现有最多 8 个关联文件及总 Token 预算共用上限；不做全仓反向依赖扫描。
 3. ProjectProfile 为每个 Batch 生成 `ProfileSlice`，只包含当前路径需要的框架事实、有效规则、规范摘录、关键入口和来源哈希。完整画像仍冻结在 ReviewJob，ProfileSlice Hash 进入请求身份。
 4. Tree 截断或画像总预算达到上限本身只保留诊断；显式要求的 companion、规范、直接依赖或历史复核上下文无法取得时，才将对应文件标记为 `context_sufficiency=limited` 并记录稳定原因。
@@ -747,7 +747,7 @@ Coverage 和发布语义：
 - 上一 Head 的有效 Finding 对应文件内容不变，即使本次模型返回零 Finding，当前 Outcome 仍保留该问题，且不为延续项新增 LLM 调用。
 - 修改问题文件并真实修复旧问题，同时在修复代码中引入独立缺陷：旧 Finding 为 `resolved`，新缺陷形成 `new` Finding；二者不得因 Fingerprint 去重互相覆盖。
 - 只移动、改写或删除旧 Evidence 时不得自动判定 resolved；定向复核失败或预算不足时为 `uncertain`，Note 明确披露。
-- 超过 500 个 blob 且画像达到 16,000 字符的 Fixture 中，位于 Tree 窗口外的历史文件和匹配 companion 仍能精确读取；无关 Tree 截断不降低 `workset_coverage`。
+- 超过 500 条路径且画像达到 16,000 字符的 Fixture 中，不扫描 Tree；历史文件和匹配 companion 仍能精确读取；自动发现不完整不降低 `workset_coverage`。
 - 必要 companion 读取失败时，代码工作集可为 full，但 `context_sufficiency` 必须为 limited，零 Finding 文案不得宣称完整无问题。
 - Compare 超时、快速连续 Push、重复 Webhook、Worker 重试和发布前 Head 变化均有稳定终态；同一 current Head 最多产生一条当前 Note。
 - 固定响应组件测试和全量 Pytest 已通过；PostgreSQL/Redis 可靠性基线沿用 M2/M3.3.1 已通过结果。至少一个真实连续 Head Shadow 场景通过后，才能把 M3.3.2 标记为“系统验收通过”。
@@ -984,7 +984,7 @@ M5 通知验收：
 |---|---|---|
 | 项目禁用、Draft、无支持文件 | skipped，记录原因 | 否或发布受控说明，按项目策略 |
 | Catalog/Plan 无效 | 永久失败，LLM 调用为 0 | 否 |
-| Optional ProjectProfile 推断文件失败或无关 Tree 截断 | 保留已取得画像，只记录画像诊断，不自动降低代码工作集覆盖 | 可发布 |
+| Optional ProjectProfile 自动发现不完整或清单读取失败 | 保留已取得画像，只记录画像诊断，不自动降低代码工作集覆盖 | 可发布 |
 | 当前批次必要 companion/standard/history 上下文不可用 | 保留已完成代码审查，`context_sufficiency=limited` 并禁止无条件零问题结论 | 可发布受限结果 |
 | previous/current Head Compare 不可用 | 退化为累计 MR 审查，记录 `HEAD_DELTA_UNAVAILABLE`，不宣称已完成增量复核 | 可发布受限结果 |
 | 历史 Finding 文件已变且定向复核失败或预算不足 | 不自动判定 resolved，transition 记为 uncertain | 可发布受限结果 |

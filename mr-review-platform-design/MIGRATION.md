@@ -140,6 +140,10 @@ shadow -> internal note -> pilot -> project rollout -> old service shutdown
 
 每个阶段都必须有项目级 Kill Switch，可停止新任务但保留查询能力。
 
+Tree-free ProjectProfile 升级说明：部署后首个新 job 可能因 profile content hash 变化触发一次
+`REVIEW_SEMANTICS_CHANGED`，旧 lineage 的 carry-forward 会重置；已冻结 profile 的重试继续使用
+已存画像，不重新发现，也不受本次升级影响。
+
 ## 8. 回滚
 
 回滚只切换 Webhook/项目开关，不回滚已产生的 Finding 数据。

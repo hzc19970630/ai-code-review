@@ -68,7 +68,7 @@ Read API：查询项目、ReviewJob、ContextManifest 和 Finding
 | M2 可靠投递与幂等 | 功能已实现，隔离依赖验收通过 | Outbox、Dispatcher、Redis 锁、Worker 原子领取、Reconciler、Note Marker Upsert、调用审计 | 生产容量、真实网络和长时间运行验证 |
 | M3.0 安全可复现基线 | 功能已实现，真实 Shadow 链路已验证 | EffectivePlan、Plan/Prompt Hash、Shadow、Head 复查、ReviewOrchestrator | 种子样本正式人工裁决和发布签字 |
 | M3.0.1 Evidence v2 | 功能已实现，专项真实复验记录待固化 | literal Evidence、行映射、稳定拒绝码、误拒绝修补 | 将真实复验样本纳入 Golden Dataset |
-| M3.1 ProjectProfile | 功能已实现，单项目真实配置读取已验证 | 目标分支信任、有界 Tree、声明路径精确读取、ContextManifest、范围覆盖 | 第二生态验证、范围覆盖的真实新 MR 验收、画像预算调优 |
+| M3.1 ProjectProfile | 功能已实现，单项目真实配置读取已验证 | 目标分支信任、无 Tree 的 manifest/workspace 精确发现、声明路径精确读取、ContextManifest、范围覆盖 | 第二生态验证、真实 monorepo workspace 发现验收、画像预算调优 |
 | M3.2 Rule/Prompt | 功能已实现 | Rule Catalog/Compiler、路径规则、Prompt Envelope、中文输出契约 | 离线质量回归、规则有效性人工裁决 |
 | M3.2.1 语法分析 | 功能已实现，TS Shadow Fixture 已验证 | TS/TSX、Python 3.12、JSON、YAML 固定分析器，稳定诊断和去重 | 多语言真实 MR 样本和失败注入复验 |
 | M3.3 大 MR | 运行代码完成，质量验收待补 | 稳定批次、总预算、部分失败、逐调用审计、聚合、Coverage | 50 个 Golden MR、两个项目 Shadow和质量阈值 |
@@ -103,10 +103,12 @@ Read API：查询项目、ReviewJob、ContextManifest 和 Finding
 ### 5.3 项目理解和仓库配置
 
 - `.ai-review.yml` 固定从可信目标版本读取，MR 自己修改的配置不会影响同一次评审。
-- Repository Tree 最多接受 500 个 blob，只用于低成本事实发现。
-- `.ai-review.yml`、`standards`、`key_paths` 和 companion 声明路径按精确 API 读取，不依赖前 500 个 blob 是否命中。
+- ProjectProfile 不再扫描递归 Repository Tree；改为 `.ai-review.yml`、根/工作区 manifest、pnpm/npm lockfile importers、`go.work`、`Cargo.toml`、`pyproject.toml` 和 Gradle includes 的精确路径发现。
+- `.ai-review.yml`、`standards`、`key_paths` 和 companion 声明路径按精确 API 读取，不依赖任何 Tree 样本；无法解析的 workspace glob 记录 `PROFILE_DISCOVERY_PARTIAL`，不降低代码工作集覆盖。
+- 关联文件从变更文件内容解析相对 import，并用有界 `get_file` 探测同名测试、public API 和 key/companion 路径，不再要求路径先出现在 Tree 样本中。
 - ProjectProfile 记录语言、框架、包管理器、源码/测试/生成目录、公共入口、规范来源和内容 Hash。
 - 平台文件范围是默认值；仓库可覆盖 `supported_extensions` 和 `ignore_paths`，最终值进入 EffectivePlan 和 `plan_hash`。
+- Tree-free profile 首次上线会让现有 active lineage 发生一次 `REVIEW_SEMANTICS_CHANGED`；冻结 profile 的重试不受影响。
 - 不执行 `git clone`，不持久化仓库缓存，不安装项目依赖。
 
 ### 5.4 评审引擎
@@ -208,7 +210,7 @@ MR `!327` 的最新有效 Job：
 | P1 | 超长 Diff 分段尚未经过真实 GitLab MR 验收 | 后半段召回和实际 Token 成本仍未知 | 用后半段已知缺陷、预算耗尽和中间失败三个场景复验 |
 | P1 | M3.3.4 真实 GitLab 重建 MR 尚未验收 | 自动化已通过，但尚缺 Provider 现场证据 | 验证相同 Head、后继 Head、分叉/歧义和乱序 Push 场景 |
 | P1 | 大 MR 最多 4 Batch | 本次 43 个 eligible 文件未语义评审 | 先用质量/成本数据调整，不直接无限增批 |
-| P1 | ProjectProfile 总预算 16,000 字符 | 大配置文件可能被截断 | 结构化提取 Manifest 事实，避免简单扩容 |
+| P1 | ProjectProfile 总预算 16,000 字符 | manifest 已优先读取并用完整内容解析 facts；超大 config 源仍会触发 `PROFILE_TOTAL_BUDGET` 并使 `sources` 截断 | 如需消除提示，进一步结构化提取或跳过大型 config 源，避免简单扩容 |
 | P1 | 跨 Attempt 输入预算单位错配 | 已用额度取 `llm_runs.prompt_tokens`（网关真实值），预留取 `bytes/4` 估算值，实测中文 TSX 批次低估约 3.7 倍；单次整单重试即可触发 `BATCH_TOTAL_INPUT_BUDGET`，Job 以 `succeeded` 加零批次覆盖结束 | 预约与记账统一到同一单位，或按 Attempt 重置总预算；现场判定前先按 `job_attempt_no` 分组核对 |
 | P1 | 被拒绝的 LLM 原始输出未落库 | `LLM_OUTPUT_INVALID` 只留下 Job 重试记录，无法复核模型实际返回了什么、违反了哪个 schema 字段 | 在 M4.0 之前先持久化裁剪后的失败输出与校验违规项，Repair 率才可度量 |
 | P1 | 生产治理未完成 | 不具备正式生产发布条件 | CI、内部 CA、备份恢复、SBOM、回滚手册 |

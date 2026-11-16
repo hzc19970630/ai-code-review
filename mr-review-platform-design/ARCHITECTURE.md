@@ -158,7 +158,7 @@ Worker 任务只传递 `review_job_id`。项目凭据、配置和任务上下文
 
 1. Worker 以条件更新将任务从 `queued` 变为 `running`。
 2. 加载任务创建时冻结的 `effective_plan` 并校验 `plan_hash`；历史任务只允许从自身 `config_snapshot` 一次性补建。
-3. GitLab Adapter 拉取 MR 元数据和 diff；ProjectProfiler 在可信目标提交上精确读取 `.ai-review.yml` 和声明的规范文件，同时只用最多 500 个 Repository Tree blob 做可选画像推断。配置声明的关键/companion 路径可绕过 Tree 样本进入候选，选中后才从冻结的 MR Head 延迟读取。仓库可分别覆盖平台默认的 `supported_extensions` 与 `ignore_paths`；Worker 将解析后的覆盖值和 ProjectProfile 原子冻结为最终 Effective Plan 后再构建 Context。
+3. GitLab Adapter 拉取 MR 元数据和 diff；ProjectProfiler 在可信目标提交上精确读取 `.ai-review.yml`、根/工作区 manifest 和声明的规范文件，不再扫描递归 Repository Tree。工作区通过 `package.json`、`pnpm-workspace.yaml`、pnpm/npm lockfile importers、`go.work`、`Cargo.toml`、`pyproject.toml` workspace members 和 Gradle includes 精确发现；无法解析的 glob 记录 `PROFILE_DISCOVERY_PARTIAL`，不降级代码工作集覆盖。关联文件从变更文件内容解析相对 import，并用有界 `get_file` 精确探测同名测试、public API、key/companion 路径；选中后才从冻结的 MR Head 延迟读取。仓库可分别覆盖平台默认的 `supported_extensions` 与 `ignore_paths`；Worker 将解析后的覆盖值和 ProjectProfile 原子冻结为最终 Effective Plan 后再构建 Context。
 4. M3.3.4 解析 ReviewLineage：同一 MR 沿用原谱系；重建 MR 只从关闭未合并的 dormant 候选中选择，并且项目、分支、替代窗口、基线和评审语义兼容，GitLab Compare 完整证明 Head 相同或连续且候选唯一时才关联。若存在谱系上一成功 Head，History Review 根据文件、Rule Hash 和关联依赖哈希确定性延续未变化 Finding，变化项进入定向复核。
 5. Context Builder 构建完整 eligible workset；超长 unified diff 按 hunk/行边界形成稳定 Segment，不在 Batch 前静默截断。任务级内存缓存只去重本次 GitLab 文件请求，不持久化 Git 仓库。
 6. Rule Compiler 按固定 Catalog 匹配通用、项目和路径级规则，并把编译结果及 Hash 冻结到本次评审输入。

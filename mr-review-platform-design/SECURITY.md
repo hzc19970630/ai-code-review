@@ -127,7 +127,7 @@ Debug 日志也必须经过同一脱敏器，并设置短保留期和访问控�
 ## 9. 仓库读取与缓存边界
 
 - M3 不执行本地 `git clone`，不持久化仓库或 GitLab Token；Worker 只通过 GitLab API 读取冻结 ref 的必要路径。
-- Repository Tree 最多读取 500 个 blob 路径；可信 `.ai-review.yml` 和经严格 Schema 校验的声明路径使用有界精确读取，不能借配置扩大为全仓下载。
+- ProjectProfile 采用精确路径发现：固定 `.ai-review.yml`、根/工作区 manifest、lockfile/workspace 声明和白名单 manifest 名；不扫描递归 Repository Tree。发现探测最多 64 次，画像读取最多 24 个文件、单文件 8,000 字符、总计 16,000 字符，不能借配置扩大为全仓下载。
 - 文件内容只存在于当前 ReviewJob 的进程内缓存和受控业务结果中，任务结束后不保留文件缓存目录。
 - 读取策略拒绝 `.env*`、`.git`、SSH key、证书、私钥和平台配置的敏感路径；ProjectProfile 仅允许白名单类型和字符预算。
 - 未来只有在正式里程碑批准本地 Git/Agent 工作区后，才引入按项目隔离目录、不可预测内部 ID、项目级锁、临时凭据、TTL/LRU 和容量回收；`.git/config` 始终不允许持久化 Token。
