@@ -13,7 +13,7 @@ from mr_review_platform.config import Settings
 from mr_review_platform.context import ChangeContext, ContextPack
 from mr_review_platform.db import Database
 from mr_review_platform.errors import ExternalServiceError
-from mr_review_platform.gitlab import HeadComparison, RepositoryTree
+from mr_review_platform.gitlab import HeadComparison
 from mr_review_platform.llm import (
     LLMCallAuditEvent,
     LLMCallRecord,
@@ -118,7 +118,6 @@ class GitLabHarness:
     heads: list[str]
     changes_head: str | None = None
     note_bodies: list[str] = field(default_factory=list)
-    tree_paths: tuple[str, ...] = ()
     repository_files: dict[tuple[str, str], str] = field(default_factory=dict)
     file_reads: list[tuple[str, str]] = field(default_factory=list)
     head_reads: int = 0
@@ -174,21 +173,20 @@ class GitLabHarness:
                     ],
                 }
 
-            def list_repository_tree(self, _project_id, _ref, *, max_entries=500):
-                paths = harness.tree_paths[:max_entries]
-                return RepositoryTree(
-                    paths=paths,
-                    truncated=len(harness.tree_paths) > len(paths),
-                )
-
             def get_file(self, _project_id, path, ref):
                 harness.file_reads.append((path, ref))
-                if (ref, path) not in harness.repository_files and path == ".ai-review.yml":
-                    return None
-                return harness.repository_files.get(
-                    (ref, path),
-                    harness.default_file_content,
-                )
+                if (ref, path) in harness.repository_files:
+                    return harness.repository_files[(ref, path)]
+                if harness.raw_changes:
+                    changed = {
+                        str(item.get("new_path") or item.get("old_path") or "")
+                        for item in harness.raw_changes
+                    }
+                else:
+                    changed = {harness.change_path}
+                if path in changed:
+                    return harness.default_file_content
+                return None
 
             def compare_heads(self, _project_id, _from_sha, _to_sha):
                 return HeadComparison(
@@ -742,11 +740,6 @@ def test_worker_builds_profile_from_target_ref_and_related_files_from_head(
     head_ref = "a" * 40
     gitlab = GitLabHarness(
         heads=[head_ref],
-        tree_paths=(
-            "app.py",
-            "pyproject.toml",
-            "tests/test_app.py",
-        ),
         repository_files={
             (target_ref, ".ai-review.yml"): (
                 "version: 1\nprofile:\n"
@@ -797,6 +790,135 @@ def test_worker_builds_profile_from_target_ref_and_related_files_from_head(
     ]
 
 
+def test_worker_resolves_direct_imports_without_repository_tree(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "diff-first.db")
+    database, job_id, _ = _seed_job(
+        settings,
+        publish_mode="shadow",
+        supported_extensions=[".py"],
+    )
+    target_ref = "c" * 40
+    head_ref = "a" * 40
+    gitlab = GitLabHarness(
+        heads=[head_ref],
+        raw_changes=[
+            {
+                "old_path": "svc/app.py",
+                "new_path": "svc/app.py",
+                "diff": (
+                    "@@ -0,0 +1,2 @@\n"
+                    "+from .helpers import thing\n"
+                    "+value = thing\n"
+                ),
+            }
+        ],
+        repository_files={
+            (target_ref, ".ai-review.yml"): "version: 1\nprofile: {}\n",
+            (head_ref, "svc/app.py"): "from .helpers import thing\nvalue = thing\n",
+            (head_ref, "svc/helpers.py"): "thing = 1\n",
+        },
+    )
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    build_calls: list[int] = []
+    original_build = worker_module.build_context_pack
+
+    def counting_build(*args, **kwargs):
+        build_calls.append(1)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(worker_module, "build_context_pack", counting_build)
+
+    worker_module.process_review_job(job_id)
+
+    with database.session() as session:
+        job = session.get(ReviewJob, job_id)
+        assert job is not None
+        assert job.status == "succeeded"
+        assert job.context_manifest is not None
+        assert job.context_manifest["related_files"] == 1
+        assert job.context_manifest["context_sufficiency"] == "sufficient"
+
+    assert len(build_calls) == 1
+    assert [item["path"] for item in llm.untrusted_contexts[0]["related_files"]] == [
+        "svc/helpers.py"
+    ]
+    assert ("svc/helpers.py", head_ref) in gitlab.file_reads
+
+
+def test_metadata_only_does_not_preload_imported_files(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TEST_GITLAB_TOKEN", "gitlab-token")
+    monkeypatch.setenv("TEST_LLM_KEY", "llm-key")
+    settings = _settings(tmp_path, "metadata-only.db")
+    database, job_id, _ = _seed_job(
+        settings,
+        publish_mode="shadow",
+        supported_extensions=[".py"],
+        data_policy="metadata_only",
+    )
+    target_ref = "c" * 40
+    head_ref = "a" * 40
+    gitlab = GitLabHarness(
+        heads=[head_ref],
+        raw_changes=[
+            {
+                "old_path": "svc/app.py",
+                "new_path": "svc/app.py",
+                "diff": "@@ -0,0 +1,1 @@\n+from .helpers import thing",
+            }
+        ],
+        repository_files={
+            (target_ref, ".ai-review.yml"): "version: 1\nprofile: {}\n",
+            (head_ref, "svc/app.py"): "from .helpers import thing\n",
+            (head_ref, "svc/helpers.py"): "thing = 1\n",
+        },
+    )
+    llm = LLMHarness()
+    _configure_worker(monkeypatch, settings, gitlab, llm)
+
+    worker_module.process_review_job(job_id)
+
+    with database.session() as session:
+        job = session.get(ReviewJob, job_id)
+        assert job is not None
+        assert job.status == "succeeded"
+
+    assert ("svc/helpers.py", head_ref) not in gitlab.file_reads
+
+
+def test_frozen_project_profile_retry_has_no_gitlab_calls() -> None:
+    class BuildGitLab:
+        def get_file(self, _project_id, path, _ref):
+            if path == "pyproject.toml":
+                return "[project]\nname='demo'\n"
+            return None
+
+    profile = worker_module._build_project_profile(
+        BuildGitLab(),
+        project_id="123",
+        mr={"diff_refs": {"start_sha": "c" * 40}},
+    )
+    frozen = profile.to_prompt()
+
+    class NoCalls:
+        pass
+
+    retried = worker_module._build_project_profile(
+        NoCalls(),
+        project_id="123",
+        mr={},
+        frozen_profile=frozen,
+    )
+
+    assert retried.content_hash == profile.content_hash
+
+
 def test_profile_budget_advisories_do_not_make_successful_review_partial(
     tmp_path,
     monkeypatch,
@@ -811,16 +933,11 @@ def test_profile_budget_advisories_do_not_make_successful_review_partial(
         heads=[head_ref],
         change_path=".ai-review.yml",
         change_diff="@@ -0,0 +1,1 @@\n+version: 1",
-        tree_paths=(
-            "eslint.config.js",
-            "package.json",
-            *(f"src/generated-{index}.py" for index in range(499)),
-        ),
         repository_files={
             (target_ref, ".ai-review.yml"): "version: 1\n",
             (head_ref, ".ai-review.yml"): "version: 1\n",
             (target_ref, "eslint.config.js"): "x" * 9_000,
-            (target_ref, "package.json"): "x" * 9_000,
+            (target_ref, "package.json"): '{"name":"demo","description":"' + "x" * 9_000 + '"}',
         },
     )
     llm = LLMHarness()
@@ -840,7 +957,6 @@ def test_profile_budget_advisories_do_not_make_successful_review_partial(
         assert job.context_manifest["limitations"] == []
         assert set(job.context_manifest["advisories"]) == {
             "已达到项目画像字符预算上限",
-            "项目画像使用的仓库树已截断",
         }
 
     assert len(gitlab.note_bodies) == 1
@@ -848,7 +964,7 @@ def test_profile_budget_advisories_do_not_make_successful_review_partial(
     assert "上下文充分度：充分" in gitlab.note_bodies[0]
     assert "评审未完整完成" not in gitlab.note_bodies[0]
     assert "- 提示：已达到项目画像字符预算上限" in gitlab.note_bodies[0]
-    assert "- 提示：项目画像使用的仓库树已截断" in gitlab.note_bodies[0]
+    assert "仓库树已截断" not in gitlab.note_bodies[0]
 
 
 def test_worker_freezes_and_uses_repository_scope_overrides(tmp_path, monkeypatch) -> None:
@@ -864,7 +980,6 @@ def test_worker_freezes_and_uses_repository_scope_overrides(tmp_path, monkeypatc
     head_ref = "a" * 40
     gitlab = GitLabHarness(
         heads=[head_ref],
-        tree_paths=("src/app.tsx", "app.py", "ignored/secret.tsx"),
         raw_changes=[
             {
                 "old_path": "src/app.tsx",
@@ -923,57 +1038,49 @@ def test_worker_freezes_and_uses_repository_scope_overrides(tmp_path, monkeypatc
 
 def test_project_profile_fetch_failure_is_explicitly_degraded() -> None:
     class FailingGitLab:
-        def list_repository_tree(self, *_args, **_kwargs):
+        def get_file(self, *_args, **_kwargs):
             raise ExternalServiceError(
-                "tree unavailable",
+                "file unavailable",
                 code="GITLAB_TEMPORARY_ERROR",
                 retryable=True,
             )
 
-    profile, paths = worker_module._build_project_profile(
+    profile = worker_module._build_project_profile(
         FailingGitLab(),
         project_id="123",
         mr={"diff_refs": {"start_sha": "c" * 40}},
     )
 
-    assert paths == ()
     assert profile.source_ref == "c" * 40
     assert profile.limitations == ("PROFILE_FILE_FETCH_FAILED",)
 
 
 def test_project_profile_base_ref_fallback_is_explicit() -> None:
     class GitLab:
-        def list_repository_tree(self, *_args, **_kwargs):
-            return RepositoryTree(paths=("pyproject.toml",), truncated=False)
-
         def get_file(self, _project_id, path, _ref):
-            if path == ".ai-review.yml":
-                return None
-            return "[project]\nname='demo'\n"
+            if path == "pyproject.toml":
+                return "[project]\nname='demo'\n"
+            return None
 
-    profile, paths = worker_module._build_project_profile(
+    profile = worker_module._build_project_profile(
         GitLab(),
         project_id="123",
         mr={"diff_refs": {"base_sha": "b" * 40}},
     )
 
-    assert paths == ("pyproject.toml",)
     assert profile.source_ref == "b" * 40
     assert "PROFILE_START_REF_UNAVAILABLE" in profile.limitations
 
 
 def test_frozen_project_profile_rejects_content_hash_drift() -> None:
     class GitLab:
-        def list_repository_tree(self, *_args, **_kwargs):
-            return RepositoryTree(paths=("pyproject.toml",), truncated=False)
-
         def get_file(self, _project_id, path, _ref):
-            if path == ".ai-review.yml":
-                return None
-            return "[project]\nname='demo'\n"
+            if path == "pyproject.toml":
+                return "[project]\nname='demo'\n"
+            return None
 
     gitlab = GitLab()
-    profile, _ = worker_module._build_project_profile(
+    profile = worker_module._build_project_profile(
         gitlab,
         project_id="123",
         mr={"diff_refs": {"start_sha": "c" * 40}},

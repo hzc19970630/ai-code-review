@@ -25,12 +25,6 @@ def _stable_diffs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 @dataclass(frozen=True)
-class RepositoryTree:
-    paths: tuple[str, ...]
-    truncated: bool
-
-
-@dataclass(frozen=True)
 class HeadComparison:
     diffs: tuple[dict[str, Any], ...]
     truncated: bool
@@ -272,48 +266,6 @@ class GitLabClient:
             truncated=bool(payload.get("compare_timeout")),
             is_descendant=is_descendant,
         )
-
-    def list_repository_tree(
-        self,
-        project_id: str,
-        ref: str,
-        *,
-        max_entries: int = 500,
-    ) -> RepositoryTree:
-        if max_entries < 1:
-            raise ValueError("max_entries must be positive")
-        paths: list[str] = []
-        page = 1
-        while True:
-            response = self._request(
-                "GET",
-                f"/api/v4/projects/{self._project(project_id)}/repository/tree",
-                params={
-                    "ref": ref,
-                    "recursive": "true",
-                    "per_page": min(100, max_entries),
-                    "page": page,
-                },
-            )
-            items = response.json()
-            if not isinstance(items, list):
-                raise ExternalServiceError(
-                    "GitLab repository tree response is invalid",
-                    code="GITLAB_RESPONSE_INVALID",
-                    retryable=False,
-                )
-            for item in items:
-                if not isinstance(item, dict) or item.get("type") != "blob":
-                    continue
-                path = str(item.get("path") or "")
-                if path:
-                    paths.append(path)
-                if len(paths) >= max_entries:
-                    return RepositoryTree(paths=tuple(sorted(set(paths))), truncated=True)
-            next_page = response.headers.get("X-Next-Page")
-            if not next_page:
-                return RepositoryTree(paths=tuple(sorted(set(paths))), truncated=False)
-            page = int(next_page)
 
     def create_note(self, project_id: str, mr_iid: int, body: str) -> str:
         response = self._request(

@@ -81,35 +81,6 @@ def test_gitlab_file_returns_none_for_binary_content() -> None:
         assert client.get_file("123", "asset.bin", "a" * 40) is None
 
 
-def test_gitlab_repository_tree_is_paginated_and_bounded() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        page = request.url.params["page"]
-        if page == "1":
-            return httpx.Response(
-                200,
-                json=[
-                    {"type": "tree", "path": "src"},
-                    {"type": "blob", "path": "package.json"},
-                    {"type": "blob", "path": "src/app.ts"},
-                ],
-                headers={"X-Next-Page": "2"},
-            )
-        return httpx.Response(
-            200,
-            json=[{"type": "blob", "path": "tests/app.test.ts"}],
-            headers={"X-Next-Page": ""},
-        )
-
-    with GitLabClient(_settings(), "token", transport=httpx.MockTransport(handler)) as client:
-        complete = client.list_repository_tree("123", "a" * 40)
-        bounded = client.list_repository_tree("123", "a" * 40, max_entries=2)
-
-    assert complete.paths == ("package.json", "src/app.ts", "tests/app.test.ts")
-    assert complete.truncated is False
-    assert bounded.paths == ("package.json", "src/app.ts")
-    assert bounded.truncated is True
-
-
 def test_gitlab_compare_heads_returns_stable_delta_and_timeout_status() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params["from"] == "a" * 40

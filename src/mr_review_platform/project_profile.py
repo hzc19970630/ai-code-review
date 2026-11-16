@@ -16,11 +16,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 PROFILE_SCHEMA_VERSION = "project-profile/v1"
 PROFILE_POLICY_VERSION = "project-profile-policy/v1"
-MAX_TREE_ENTRIES = 500
 MAX_PROFILE_FILES = 24
 MAX_FILE_CHARS = 8_000
 MAX_STANDARD_CHARS = 4_000
 MAX_TOTAL_CHARS = 16_000
+MAX_DISCOVERY_PROBES = 64
+MAX_DISCOVERY_MEMBERS = 32
+MAX_DISCOVERY_LOCKFILE_CHARS = 1_000_000
+MAX_PUBLIC_API_PROBES = 8
 
 _PROFILE_FILES = {
     ".ai-review.yml",
@@ -58,11 +61,30 @@ _CONFIG_NAMES = _PROFILE_FILES - {
     "pom.xml",
     "pyproject.toml",
 }
+_FACT_FILES = {
+    ".ai-review.yml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Cargo.toml",
+    "composer.json",
+    "go.mod",
+    "go.work",
+    "package.json",
+    "pom.xml",
+    "pyproject.toml",
+}
 _SOURCE_DIR_NAMES = {"app", "apps", "cmd", "internal", "lib", "packages", "pkg", "src"}
+_SOURCE_CONVENTION_DIRS = ("src", "app", "cmd", "internal", "lib", "pkg")
 _TEST_DIR_NAMES = {"__tests__", "spec", "specs", "test", "tests"}
 _GENERATED_DIR_NAMES = {"build", "coverage", "dist", "generated", "out", "target"}
 _STANDARD_EXTENSIONS = {".md", ".rst", ".txt"}
 _REVIEW_EXTENSION_RE = re.compile(r"^\.[a-z0-9][a-z0-9._+-]{0,31}$")
+_DISCOVERY_ROOT_FILES = _PROFILE_FILES | {
+    "pnpm-workspace.yaml",
+    "pnpm-lock.yaml",
+    "package-lock.json",
+}
+_JS_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx", ".vue"}
 
 
 def _canonical_json(value: Any) -> str:
@@ -271,7 +293,7 @@ class ProjectProfile(BaseModel):
             ),
             "PROFILE_FILE_LIMIT": "已达到项目画像文件数量上限",
             "PROFILE_TOTAL_BUDGET": "已达到项目画像字符预算上限",
-            "PROFILE_TREE_TRUNCATED": "项目画像使用的仓库树已截断",
+            "PROFILE_DISCOVERY_PARTIAL": "项目画像自动发现不完整（部分工作区或清单未解析）",
             "PROFILE_TARGET_REF_UNAVAILABLE": ("可信目标分支版本不可用，当前使用通用项目上下文"),
             "PROFILE_START_REF_UNAVAILABLE": ("目标起始版本不可用，项目画像改用合并基准版本"),
         }
@@ -291,16 +313,307 @@ def generic_project_profile(
     )
 
 
+@dataclass(frozen=True)
+class ProfileDiscovery:
+    paths: tuple[str, ...]
+    workspace_roots: tuple[str, ...]
+    complete: bool
+
+
+def _as_workspace_items(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _package_workspace_items(content: str) -> list[str]:
+    data = json.loads(content)
+    if not isinstance(data, dict):
+        return []
+    workspaces = data.get("workspaces")
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages")
+    return _as_workspace_items(workspaces)
+
+
+def _pnpm_workspace_items(content: str) -> list[str]:
+    data = yaml.safe_load(content) or {}
+    if not isinstance(data, dict):
+        return []
+    return _as_workspace_items(data.get("packages"))
+
+
+def _pnpm_lock_importers(content: str) -> list[str]:
+    members: list[str] = []
+    in_importers = False
+    for line in content.splitlines():
+        if not in_importers:
+            if line.startswith("importers:"):
+                in_importers = True
+            continue
+        if not line.strip():
+            continue
+        if not line.startswith(" "):
+            break
+        if line.startswith("  ") and not line.startswith("    "):
+            key = line.strip()
+            if key.endswith(":"):
+                key = key[:-1]
+            key = key.strip().strip("'\"")
+            if key and key != ".":
+                members.append(key)
+    return members
+
+
+def _package_lock_members(content: str) -> list[str]:
+    data = json.loads(content)
+    if not isinstance(data, dict):
+        return []
+    packages = data.get("packages")
+    if not isinstance(packages, dict):
+        return []
+    members: list[str] = []
+    for key in packages:
+        if not key or key.startswith("node_modules/") or "/node_modules/" in key:
+            continue
+        members.append(key.removeprefix("./"))
+    return members
+
+
+def _cargo_workspace_members(content: str) -> list[str]:
+    data = tomllib.loads(content)
+    workspace = data.get("workspace")
+    if not isinstance(workspace, dict):
+        return []
+    return _as_workspace_items(workspace.get("members"))
+
+
+def _pyproject_workspace_members(content: str) -> list[str]:
+    data = tomllib.loads(content)
+    tool = data.get("tool") if isinstance(data.get("tool"), dict) else {}
+    uv = tool.get("uv") if isinstance(tool.get("uv"), dict) else {}
+    uv_workspace = uv.get("workspace") if isinstance(uv.get("workspace"), dict) else {}
+    members = list(_as_workspace_items(uv_workspace.get("members")))
+    poetry = tool.get("poetry") if isinstance(tool.get("poetry"), dict) else {}
+    for item in poetry.get("packages") or ():
+        if isinstance(item, dict) and isinstance(item.get("include"), str):
+            members.append(item["include"])
+    return members
+
+
+def _gradle_includes(content: str) -> list[str]:
+    members: list[str] = []
+    for match in re.finditer(r"include\s*(?:\(([^)]*)\)|([^\n]+))", content):
+        raw = match.group(1) or match.group(2) or ""
+        for item in raw.split(","):
+            candidate = item.strip().strip("'\"").lstrip(":").replace(":", "/")
+            if candidate:
+                members.append(candidate)
+    return members
+
+
+def _member_manifest_candidates(
+    ecosystem: str,
+    member: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    prefix = f"{member}/"
+    if ecosystem == "js":
+        return (prefix + "package.json",), (prefix + "tsconfig.json",)
+    if ecosystem == "go":
+        return (prefix + "go.mod",), ()
+    if ecosystem == "rust":
+        return (prefix + "Cargo.toml",), ()
+    if ecosystem == "python":
+        return (prefix + "pyproject.toml",), ()
+    if ecosystem == "java":
+        return (
+            (prefix + "pom.xml", prefix + "build.gradle", prefix + "build.gradle.kts"),
+            (),
+        )
+    return (), ()
+
+
+def discover_profile_paths(
+    *,
+    file_loader: Callable[[str], str | None],
+    max_manifest_probes: int = MAX_DISCOVERY_PROBES,
+) -> ProfileDiscovery:
+    """Discover profile inputs with exact-path probes only.
+
+    The global repository tree is deliberately not consulted. Unknown workspace
+    globs that cannot be resolved from a lockfile are reported as partial instead
+    of falling back to a full-repository listing.
+    """
+
+    paths: set[str] = set()
+    workspace_roots: set[str] = {"."}
+    members_by_ecosystem: dict[str, set[str]] = {}
+    globs_by_ecosystem: set[str] = set()
+    lockfile_exact_ecosystems: set[str] = set()
+    complete = True
+    probes = 0
+    cache: dict[str, str | None] = {}
+
+    def load(path: str) -> str | None:
+        nonlocal probes, complete
+        if path in cache:
+            return cache[path]
+        if probes >= max_manifest_probes:
+            complete = False
+            cache[path] = None
+            return None
+        probes += 1
+        content = file_loader(path)
+        cache[path] = content
+        return content
+
+    root_contents: dict[str, str] = {}
+    for name in sorted(_DISCOVERY_ROOT_FILES):
+        content = load(name)
+        if content is not None:
+            paths.add(name)
+            root_contents[name] = content
+
+    def add_members(
+        ecosystem: str,
+        items: Iterable[str],
+        *,
+        from_lockfile: bool = False,
+    ) -> None:
+        nonlocal complete
+        exact: list[str] = []
+        for item in items:
+            value = str(item).strip()
+            if not value or value.startswith("!"):
+                continue
+            if any(char in value for char in "*?[{"):
+                globs_by_ecosystem.add(ecosystem)
+                continue
+            safe = _safe_repo_path(value.rstrip("/"))
+            if safe is None or safe == ".":
+                continue
+            exact.append(safe)
+        if from_lockfile and exact:
+            lockfile_exact_ecosystems.add(ecosystem)
+        for member in exact:
+            if len(workspace_roots) - 1 >= MAX_DISCOVERY_MEMBERS:
+                complete = False
+                break
+            members_by_ecosystem.setdefault(ecosystem, set()).add(member)
+            workspace_roots.add(member)
+
+    def parse(
+        ecosystem: str,
+        name: str,
+        parser: Callable[[str], Iterable[str]],
+        *,
+        from_lockfile: bool = False,
+    ) -> None:
+        nonlocal complete
+        content = root_contents.get(name)
+        if content is None:
+            return
+        if name in {"pnpm-lock.yaml", "package-lock.json"} and (
+            len(content) > MAX_DISCOVERY_LOCKFILE_CHARS
+        ):
+            complete = False
+            return
+        try:
+            items = parser(content)
+        except (ValueError, TypeError, yaml.YAMLError, tomllib.TOMLDecodeError):
+            complete = False
+            return
+        add_members(ecosystem, items, from_lockfile=from_lockfile)
+
+    parse("js", "package.json", _package_workspace_items)
+    parse("js", "pnpm-workspace.yaml", _pnpm_workspace_items)
+    parse("js", "pnpm-lock.yaml", _pnpm_lock_importers, from_lockfile=True)
+    parse("js", "package-lock.json", _package_lock_members, from_lockfile=True)
+    parse("go", "go.work", lambda content: _parse_go_work_roots(content, "."))
+    parse("rust", "Cargo.toml", _cargo_workspace_members)
+    parse("python", "pyproject.toml", _pyproject_workspace_members)
+    parse("java", "settings.gradle", _gradle_includes)
+    parse("java", "settings.gradle.kts", _gradle_includes)
+
+    for ecosystem in sorted(globs_by_ecosystem):
+        if ecosystem not in lockfile_exact_ecosystems and not members_by_ecosystem.get(
+            ecosystem
+        ):
+            complete = False
+
+    for ecosystem, members in sorted(members_by_ecosystem.items()):
+        for member in sorted(members):
+            primary, optional = _member_manifest_candidates(ecosystem, member)
+            found = False
+            for candidate in primary:
+                content = load(candidate)
+                if content is not None:
+                    paths.add(candidate)
+                    found = True
+                    break
+            if not found:
+                complete = False
+                continue
+            for candidate in optional:
+                if load(candidate) is not None:
+                    paths.add(candidate)
+
+    return ProfileDiscovery(
+        paths=tuple(sorted(paths)),
+        workspace_roots=tuple(sorted(workspace_roots)),
+        complete=complete,
+    )
+
+
+def _apply_workspace_conventions(
+    facts: _ProfileFacts,
+    workspace_roots: Iterable[str],
+) -> None:
+    for raw_root in workspace_roots:
+        value = str(raw_root).strip()
+        root = "." if value in {"", "."} else _safe_repo_path(value)
+        if root is None:
+            continue
+        prefix = "" if root == "." else f"{root}/"
+        for name in _SOURCE_CONVENTION_DIRS:
+            facts.source_dirs.add(prefix + name)
+        for name in _TEST_DIR_NAMES:
+            facts.test_dirs.add(prefix + name)
+        for name in _GENERATED_DIR_NAMES:
+            facts.generated_dirs.add(prefix + name)
+
+
+def _verified_public_api_entries(
+    entries: Iterable[str],
+    *,
+    known_paths: Iterable[str],
+    file_loader: Callable[[str], str | None],
+    max_probes: int = MAX_PUBLIC_API_PROBES,
+) -> set[str]:
+    known = {path for path in known_paths if path}
+    verified = {entry for entry in entries if entry in known}
+    probes = 0
+    for entry in sorted(set(entries) - known):
+        if probes >= max_probes:
+            break
+        probes += 1
+        try:
+            content = file_loader(entry)
+        except Exception:
+            content = None
+        if content is not None:
+            verified.add(entry)
+    return verified
+
+
 class ProjectProfiler:
     def __init__(
         self,
         *,
-        max_tree_entries: int = MAX_TREE_ENTRIES,
         max_files: int = MAX_PROFILE_FILES,
         max_file_chars: int = MAX_FILE_CHARS,
         max_total_chars: int = MAX_TOTAL_CHARS,
     ) -> None:
-        self.max_tree_entries = max_tree_entries
         self.max_files = max_files
         self.max_file_chars = max_file_chars
         self.max_total_chars = max_total_chars
@@ -309,28 +622,49 @@ class ProjectProfiler:
         self,
         *,
         source_ref: str,
-        repository_paths: Iterable[str],
         file_loader: Callable[[str], str | None],
-        tree_truncated: bool = False,
+        discovered_paths: Iterable[str] | None = None,
+        workspace_roots: Iterable[str] = (),
+        discovery_complete: bool = True,
     ) -> ProjectProfile:
+        limitations: set[str] = set()
+        if discovered_paths is None:
+            discovery = discover_profile_paths(file_loader=file_loader)
+            raw_paths: Iterable[str] = discovery.paths
+            raw_workspace_roots: Iterable[str] = discovery.workspace_roots
+            discovery_complete = discovery.complete
+        else:
+            raw_paths = discovered_paths
+            raw_workspace_roots = workspace_roots
         paths = sorted(
             {
                 safe
-                for raw_path in repository_paths
+                for raw_path in raw_paths
                 if (safe := _safe_repo_path(str(raw_path))) is not None
             }
         )
-        limitations: set[str] = set()
-        if tree_truncated:
-            limitations.add("PROFILE_TREE_TRUNCATED")
-        if len(paths) > self.max_tree_entries:
-            paths = paths[: self.max_tree_entries]
-            limitations.add("PROFILE_TREE_TRUNCATED")
+        roots_set: set[str] = set()
+        for raw_root in raw_workspace_roots:
+            value = str(raw_root).strip()
+            if value in {"", "."}:
+                roots_set.add(".")
+            elif (safe := _safe_repo_path(value)) is not None:
+                roots_set.add(safe)
+        roots = tuple(sorted(roots_set or {"."}))
+        if not discovery_complete:
+            limitations.add("PROFILE_DISCOVERY_PARTIAL")
 
         candidates = [path for path in paths if PurePosixPath(path).name in _PROFILE_FILES]
-        candidates.sort(key=lambda path: (path.count("/"), path))
+        candidates.sort(
+            key=lambda path: (
+                PurePosixPath(path).name not in _FACT_FILES,
+                path.count("/"),
+                path,
+            )
+        )
 
         loaded: dict[str, str] = {}
+        full_contents: dict[str, str] = {}
         attempted_paths: set[str] = set()
         sources: list[ProfileSource] = []
         total_chars = 0
@@ -369,6 +703,7 @@ class ProjectProfiler:
                 limitations.add("PROFILE_TOTAL_BUDGET")
             total_chars += len(visible)
             loaded[path] = visible
+            full_contents[path] = content
             sources.append(
                 ProfileSource(
                     path=path,
@@ -394,7 +729,10 @@ class ProjectProfiler:
         )
         if config_text is not None:
             try:
-                raw_config = yaml.load(config_text, Loader=_NoAliasSafeLoader) or {}
+                raw_config = yaml.load(
+                    full_contents.get(".ai-review.yml", config_text),
+                    Loader=_NoAliasSafeLoader,
+                ) or {}
                 if not isinstance(raw_config, dict):
                     raise ValueError("repository review config must be an object")
                 parsed_config = RepositoryReviewConfig.model_validate(raw_config)
@@ -444,7 +782,7 @@ class ProjectProfiler:
             )
 
         # Explicit configuration and standards consume the shared file/character
-        # budgets first. Tree-discovered manifests are optional inference inputs.
+        # budgets first. Discovered manifests are optional inference inputs.
         for path in candidates:
             if path == ".ai-review.yml":
                 continue
@@ -454,8 +792,9 @@ class ProjectProfiler:
             read_profile_file(path, kind)
 
         facts = _ProfileFacts(paths)
-        for path, content in loaded.items():
+        for path, content in full_contents.items():
             facts.consume(path, content)
+        facts.workspace_roots.update(roots)
 
         for path in profile_config.source_dirs:
             if safe := _safe_repo_path(path):
@@ -466,9 +805,15 @@ class ProjectProfiler:
         for path in profile_config.generated_dirs:
             if safe := _safe_repo_path(path):
                 facts.generated_dirs.add(safe)
+        _apply_workspace_conventions(facts, roots)
         key_paths = {
             safe for path in profile_config.key_paths if (safe := _safe_repo_path(path)) is not None
         }
+        facts.public_api_entries = _verified_public_api_entries(
+            facts.public_api_entries,
+            known_paths=[*(item.path for item in sources), *key_paths],
+            file_loader=file_loader,
+        )
         companion_patterns: list[CompanionRule] = []
         for rule in profile_config.companion_patterns:
             match = _safe_glob(rule.match)
@@ -504,7 +849,12 @@ class ProjectProfiler:
         )
 
         if not configured:
-            if facts.languages or facts.frameworks or facts.config_entries:
+            if (
+                facts.languages
+                or facts.frameworks
+                or facts.package_managers
+                or facts.config_entries
+            ):
                 limitations.add("PROFILE_INFERRED")
             else:
                 limitations.add("PROFILE_NOT_CONFIGURED")
@@ -652,7 +1002,11 @@ class _ProfileFacts:
             workspaces = workspaces.get("packages")
         if isinstance(workspaces, list):
             for item in workspaces:
-                if isinstance(item, str) and (safe := _safe_repo_path(item.rstrip("/*"))):
+                if (
+                    isinstance(item, str)
+                    and not any(char in item for char in "*?[{")
+                    and (safe := _safe_repo_path(item.rstrip("/")))
+                ):
                     self.workspace_roots.add(_join_root(root, safe))
         for key in ("main", "module", "types"):
             if isinstance(data.get(key), str):
@@ -794,23 +1148,38 @@ _JS_IMPORT_RE = re.compile(
 _PY_IMPORT_RE = re.compile(r"^\s*from\s+(?P<dots>\.+)(?P<path>[A-Za-z0-9_.]*)\s+import\s+", re.M)
 
 
+def _join_repo_path(directory: str, name: str) -> str:
+    return name if not directory or directory == "." else f"{directory}/{name}"
+
+
+def _ancestor_dirs(parent: str, workspace_roots: Iterable[str]) -> list[str]:
+    roots = {root for root in workspace_roots if root}
+    directories: list[str] = []
+    current = parent
+    while True:
+        directories.append(current)
+        if current in roots or not current:
+            break
+        current = posixpath.dirname(current)
+    return directories
+
+
 def select_direct_import_paths(
     *,
     changed_contents: dict[str, str],
-    repository_paths: Iterable[str],
     profile: ProjectProfile,
     file_loader: Callable[[str], str | None] | None = None,
+    discovered_paths: Iterable[str] = (),
     max_files: int = 8,
 ) -> list[RelatedPathSelection]:
     """Resolve a bounded one-hop set of relative imports to exact repository paths."""
 
     known = {
         safe
-        for raw_path in repository_paths
+        for raw_path in discovered_paths
         if (safe := _safe_repo_path(str(raw_path))) is not None
     }
     known.update(profile.key_paths)
-    known.update(profile.public_api_entries)
     known.update(source.path for source in profile.sources)
     for rule in profile.companion_patterns:
         known.update(rule.paths)
@@ -844,13 +1213,12 @@ def select_direct_import_paths(
                     break
                 probe_count += 1
                 try:
-                    if file_loader(item) is not None:
-                        candidate = item
-                        break
+                    content = file_loader(item)
                 except Exception:
                     continue
-            if candidate is None:
-                candidate = candidates[0]
+                if content is not None:
+                    candidate = item
+                    break
         if candidate is None:
             return
         if candidate not in changed:
@@ -859,7 +1227,7 @@ def select_direct_import_paths(
     for path, content in sorted(changed_contents.items()):
         parent = posixpath.dirname(path)
         suffix = PurePosixPath(path).suffix.lower()
-        if suffix in {".js", ".jsx", ".ts", ".tsx", ".vue"}:
+        if suffix in _JS_EXTENSIONS:
             for match in _JS_IMPORT_RE.finditer(content):
                 choose(posixpath.normpath(posixpath.join(parent, match.group("path"))), suffix)
         elif suffix == ".py":
@@ -877,57 +1245,117 @@ def select_direct_import_paths(
     ]
 
 
+def _same_name_test_candidates(
+    changed_path: str,
+    workspace_roots: Iterable[str],
+) -> list[str]:
+    pure = PurePosixPath(changed_path)
+    stem = pure.stem
+    if not stem:
+        return []
+    suffix = pure.suffix.lower()
+    parent = "" if str(pure.parent) == "." else str(pure.parent)
+    names: list[str] = []
+    if suffix:
+        names.extend(
+            [
+                f"{stem}.test{suffix}",
+                f"{stem}.spec{suffix}",
+                f"test_{stem}{suffix}",
+                f"{stem}_test{suffix}",
+            ]
+        )
+    if suffix in _JS_EXTENSIONS:
+        for extension in sorted(_JS_EXTENSIONS):
+            names.extend([f"{stem}.test{extension}", f"{stem}.spec{extension}"])
+    if suffix == ".py":
+        names.extend([f"test_{stem}.py", f"{stem}_test.py"])
+
+    directories: list[str] = []
+    for base in _ancestor_dirs(parent, workspace_roots):
+        directories.append(base)
+        for sub in ("tests", "test", "__tests__", "spec", "specs"):
+            directories.append(_join_repo_path(base, sub))
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for directory in dict.fromkeys(directories):
+        for name in dict.fromkeys(names):
+            candidate = _join_repo_path(directory, name)
+            if candidate not in seen:
+                seen.add(candidate)
+                candidates.append(candidate)
+    return candidates
+
+
 def select_related_paths(
     *,
     changed_paths: Iterable[str],
-    repository_paths: Iterable[str],
     profile: ProjectProfile,
+    file_loader: Callable[[str], str | None] | None = None,
+    discovered_paths: Iterable[str] = (),
     max_files: int = 8,
+    max_probes: int = 48,
 ) -> list[RelatedPathSelection]:
     changed = {_safe_repo_path(path) for path in changed_paths}
     changed.discard(None)
     available = {
         safe
-        for raw_path in repository_paths
+        for raw_path in discovered_paths
         if (safe := _safe_repo_path(str(raw_path))) is not None
     }
-    # Exact paths approved in the trusted-target profile do not need to appear in
-    # the bounded repository-tree sample. They remain subject to the related-file
-    # count and context-character budgets when selected and fetched.
+    # Declared/verified paths are free; inferred public API entries must pass a
+    # bounded existence probe instead of relying on a repository-tree sample.
     available.update(profile.key_paths)
+    available.update(source.path for source in profile.sources)
     for rule in profile.companion_patterns:
         available.update(rule.paths)
+    probe_cache: dict[str, bool] = {}
+    probe_count = 0
     ranked: dict[str, tuple[int, str]] = {}
 
-    def add(path: str, priority: int, reason: str) -> None:
-        if path in changed or path not in available:
-            return
-        current = ranked.get(path)
-        if current is None or priority < current[0]:
-            ranked[path] = (priority, reason)
+    def verified(path: str) -> bool:
+        nonlocal probe_count
+        if path in available:
+            return True
+        if file_loader is None:
+            return False
+        if path in probe_cache:
+            return probe_cache[path]
+        if probe_count >= max_probes:
+            return False
+        probe_count += 1
+        try:
+            content = file_loader(path)
+        except Exception:
+            content = None
+        probe_cache[path] = content is not None
+        return probe_cache[path]
 
-    for changed_path in sorted(path for path in changed if path is not None):
-        pure = PurePosixPath(changed_path)
-        stem = pure.stem
-        suffix = pure.suffix
-        for candidate in available:
-            candidate_path = PurePosixPath(candidate)
-            candidate_stem = candidate_path.stem
-            same_name_test = candidate_stem in {
-                f"{stem}.test",
-                f"{stem}.spec",
-                f"test_{stem}",
-                f"{stem}_test",
-            }
-            if same_name_test and (candidate_path.suffix == suffix or not suffix):
-                add(candidate, 10, "same_name_test")
+    def add(path: str, priority: int, reason: str, *, verify: bool = False) -> None:
+        safe = _safe_repo_path(path)
+        if safe is None or safe in changed:
+            return
+        if verify and not verified(safe):
+            return
+        if not verify and safe not in available:
+            return
+        current = ranked.get(safe)
+        if current is None or priority < current[0]:
+            ranked[safe] = (priority, reason)
+
+    for changed_path in sorted(changed):
+        for candidate in _same_name_test_candidates(changed_path, profile.workspace_roots):
+            add(candidate, 10, "same_name_test", verify=True)
         for rule in profile.companion_patterns:
             if fnmatch(changed_path, rule.match):
                 for candidate in rule.paths:
                     add(candidate, 20, f"companion_pattern:{rule.match}")
 
+    roots = {path.split("/", 1)[0] for path in changed}
     for path in profile.public_api_entries:
-        add(path, 30, "public_api_entry")
+        if roots and path.split("/", 1)[0] not in roots:
+            continue
+        add(path, 30, "public_api_entry", verify=True)
     for path in profile.key_paths:
         add(path, 40, "project_key_path")
 

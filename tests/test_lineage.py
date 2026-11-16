@@ -10,6 +10,7 @@ from mr_review_platform.lineage import (
     apply_lineage_lifecycle,
     ensure_active_lineage,
     resolve_review_lineage,
+    review_semantics_hash,
 )
 from mr_review_platform.models import (
     LineageFindingState,
@@ -17,6 +18,8 @@ from mr_review_platform.models import (
     ReviewJob,
     ReviewLineage,
 )
+from mr_review_platform.project_profile import ProjectProfile
+from mr_review_platform.review_plan import build_effective_review_plan
 
 
 def _database(tmp_path, name: str = "lineage.db") -> Database:
@@ -103,6 +106,42 @@ def _dormant_lineage(
     session.add(parent)
     session.flush()
     return lineage, parent
+
+
+def test_profile_content_change_rotates_review_semantics_hash() -> None:
+    plan = build_effective_review_plan(
+        {
+            "config_version": 1,
+            "review_enabled": True,
+            "review_strategy": "simple_context",
+            "prompt_profile": "default",
+            "llm_provider": "openai-compatible",
+            "llm_model": "test-model",
+            "llm_credential_ref": "env://TEST_LLM_KEY",
+            "data_policy": "internal_only",
+            "publish_mode": "publish",
+            "supported_extensions": [".py"],
+            "ignore_paths": [],
+            "enabled_rules": ["correctness"],
+            "max_input_tokens": 12_000,
+            "min_confidence": 70,
+        }
+    )
+    old_profile = ProjectProfile(
+        source_ref="c" * 40,
+        workspace_roots=(".",),
+        source_dirs=("src",),
+        total_chars=0,
+    )
+    new_profile = ProjectProfile(
+        source_ref="c" * 40,
+        workspace_roots=(".", "packages/app"),
+        source_dirs=("packages/app/src", "src"),
+        total_chars=0,
+    )
+
+    assert review_semantics_hash(plan, old_profile) == review_semantics_hash(plan, old_profile)
+    assert review_semantics_hash(plan, old_profile) != review_semantics_hash(plan, new_profile)
 
 
 def test_descendant_head_rebuild_inherits_unique_dormant_lineage(tmp_path) -> None:

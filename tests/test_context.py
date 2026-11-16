@@ -156,7 +156,6 @@ def test_context_adds_related_and_profile_files_with_provenance() -> None:
     }
     profile = ProjectProfiler().build(
         source_ref="b" * 40,
-        repository_paths=files,
         file_loader=files.get,
     )
     context = build_context_pack(
@@ -205,9 +204,9 @@ def test_profile_advisories_do_not_reduce_workset_or_context_sufficiency() -> No
     }
     profile = ProjectProfiler().build(
         source_ref="b" * 40,
-        repository_paths=files,
+        discovered_paths=("package.json",),
         file_loader=files.get,
-        tree_truncated=True,
+        discovery_complete=False,
     )
     context = build_context_pack(
         project_path="team/demo",
@@ -230,7 +229,7 @@ def test_profile_advisories_do_not_reduce_workset_or_context_sufficiency() -> No
     assert context.manifest is not None
     assert context.manifest.workset_coverage == "full"
     assert context.manifest.context_sufficiency == "sufficient"
-    assert any("仓库树已截断" in item for item in context.manifest.advisories)
+    assert any("自动发现不完整" in item for item in context.manifest.advisories)
 
 
 def test_required_related_file_failure_limits_context_but_not_workset() -> None:
@@ -289,9 +288,9 @@ def test_context_manifest_marks_overflow_and_profile_degradation_as_partial() ->
     }
     profile = ProjectProfiler().build(
         source_ref="b" * 40,
-        repository_paths=files,
+        discovered_paths=("package.json",),
         file_loader=files.get,
-        tree_truncated=True,
+        discovery_complete=False,
     )
     context = build_context_pack(
         project_path="team/demo",
@@ -318,8 +317,8 @@ def test_context_manifest_marks_overflow_and_profile_degradation_as_partial() ->
     assert context.manifest.limitations == tuple(sorted(set(context.limitations)))
     assert any("超出响应上限" in item for item in context.manifest.limitations)
     assert context.manifest.reason_counts["GITLAB_DIFF_LIST_TRUNCATED"] == 1
-    assert any("仓库树已截断" in item for item in context.manifest.advisories)
-    assert not any("仓库树已截断" in item for item in context.manifest.limitations)
+    assert any("自动发现不完整" in item for item in context.manifest.advisories)
+    assert not any("自动发现不完整" in item for item in context.manifest.limitations)
 
 
 def test_first_context_item_never_exceeds_small_total_budget() -> None:
@@ -351,7 +350,6 @@ def test_changed_manifest_and_target_profile_keep_distinct_source_identity() -> 
     files = {"package.json": '{"dependencies":{"react":"19"}}'}
     profile = ProjectProfiler().build(
         source_ref=target_ref,
-        repository_paths=files,
         file_loader=files.get,
     )
 

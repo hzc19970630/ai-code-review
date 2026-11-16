@@ -18,7 +18,12 @@ from mr_review_platform.batching import (
     refresh_changed_file_statuses,
 )
 from mr_review_platform.config import Settings, get_settings
-from mr_review_platform.context import ContextPack, build_context_pack, diff_added_line_map
+from mr_review_platform.context import (
+    ContextPack,
+    build_context_pack,
+    diff_added_line_map,
+    preload_changed_contents,
+)
 from mr_review_platform.context_manifest import (
     FindingProvenance,
     FindingTransition,
@@ -58,7 +63,6 @@ from mr_review_platform.models import (
 from mr_review_platform.orchestrator import ReviewOrchestrator, build_syntax_findings
 from mr_review_platform.outbox import ensure_review_job_outbox_event
 from mr_review_platform.project_profile import (
-    MAX_TREE_ENTRIES,
     ProjectProfile,
     ProjectProfiler,
     RelatedPathSelection,
@@ -2022,7 +2026,7 @@ def _build_project_profile(
     project_id: str,
     mr: dict[str, Any],
     frozen_profile: dict[str, Any] | None = None,
-) -> tuple[ProjectProfile, tuple[str, ...]]:
+) -> ProjectProfile:
     if frozen_profile is not None:
         stored = dict(frozen_profile)
         expected_hash = str(stored.pop("content_hash", ""))
@@ -2040,15 +2044,7 @@ def _build_project_profile(
                 code="PROJECT_PROFILE_HASH_MISMATCH",
                 retryable=False,
             )
-        try:
-            tree = gitlab.list_repository_tree(
-                project_id,
-                profile.source_ref,
-                max_entries=MAX_TREE_ENTRIES,
-            )
-            return profile, tree.paths
-        except (AttributeError, ExternalServiceError):
-            return profile, ()
+        return profile
 
     diff_refs = mr.get("diff_refs") or {}
     start_ref = str(diff_refs.get("start_sha") or "")
@@ -2058,24 +2054,19 @@ def _build_project_profile(
         return generic_project_profile(
             "trusted-target-ref-unavailable",
             limitation="PROFILE_TARGET_REF_UNAVAILABLE",
-        ), ()
-    list_tree = getattr(gitlab, "list_repository_tree", None)
-    if not callable(list_tree):
-        return generic_project_profile(
-            source_ref,
-            limitation="PROFILE_FILE_FETCH_FAILED",
-        ), ()
-    try:
-        tree = list_tree(
-            project_id,
-            source_ref,
-            max_entries=MAX_TREE_ENTRIES,
         )
+
+    profile_cache: dict[str, str | None] = {}
+
+    def load_profile_file(path: str) -> str | None:
+        if path not in profile_cache:
+            profile_cache[path] = gitlab.get_file(project_id, path, source_ref)
+        return profile_cache[path]
+
+    try:
         profile = ProjectProfiler().build(
             source_ref=source_ref,
-            repository_paths=tree.paths,
-            file_loader=lambda path: gitlab.get_file(project_id, path, source_ref),
-            tree_truncated=tree.truncated,
+            file_loader=load_profile_file,
         )
         if not start_ref and base_ref:
             profile = profile.model_copy(
@@ -2085,12 +2076,12 @@ def _build_project_profile(
                     )
                 }
             )
-        return profile, tree.paths
+        return profile
     except ExternalServiceError:
         return generic_project_profile(
             source_ref,
             limitation="PROFILE_FILE_FETCH_FAILED",
-        ), ()
+        )
 
 
 class _AuditedReviewModel:
@@ -2231,7 +2222,7 @@ def process_review_job(review_job_id: int) -> None:
                 return
             raw_changes = [dict(item) for item in changes_response["changes"]]
             history_enabled = plan.plan_version in {"m3.3.2-v1", "m3.3.3-v1"}
-            project_profile, repository_paths = _build_project_profile(
+            project_profile = _build_project_profile(
                 gitlab,
                 project_id=job.provider_project_id,
                 mr=mr,
@@ -2385,27 +2376,43 @@ def process_review_job(review_job_id: int) -> None:
             if no_op_head_delta:
                 raw_changes = []
 
+            changed_paths = [
+                str(change.get("new_path") or change.get("old_path") or "")
+                for change in raw_changes
+            ]
             if plan.review_strategy == "diff_only":
                 file_loader = skip_file_content
                 related_paths = []
             elif plan.review_strategy == "simple_context":
-                file_loader = load_file
-                related_paths = (
-                    []
-                    if no_op_head_delta
-                    else _merge_related_selections(
-                        prepared_history.dependency_selections,
-                        select_related_paths(
-                            changed_paths=[
-                                str(change.get("new_path") or change.get("old_path") or "")
-                                for change in raw_changes
-                            ],
-                            repository_paths=repository_paths,
+                if plan.data_policy == "metadata_only":
+                    file_loader = skip_file_content
+                    related_paths = []
+                else:
+                    file_loader = load_file
+                    if no_op_head_delta:
+                        related_paths = []
+                    else:
+                        changed_contents = preload_changed_contents(
+                            raw_changes,
+                            supported_extensions=list(plan.supported_extensions),
+                            ignore_paths=list(plan.ignore_paths),
+                            file_loader=load_file,
+                        )
+                        direct_imports = select_direct_import_paths(
+                            changed_contents=changed_contents,
                             profile=project_profile,
-                            max_files=32,
-                        ),
-                    )
-                )
+                            file_loader=load_file,
+                        )
+                        related_paths = _merge_related_selections(
+                            prepared_history.dependency_selections,
+                            select_related_paths(
+                                changed_paths=changed_paths,
+                                profile=project_profile,
+                                file_loader=load_file,
+                                max_files=32,
+                            ),
+                            direct_imports,
+                        )
             else:
                 raise ExternalServiceError(
                     "unsupported review strategy",
@@ -2469,38 +2476,6 @@ def process_review_job(review_job_id: int) -> None:
                 )
 
             context = make_context(related_paths)
-            if (
-                plan.review_strategy == "simple_context"
-                and history_enabled
-                and not no_op_head_delta
-            ):
-                changed_path_set = {
-                    str(change.get("new_path") or change.get("old_path") or "")
-                    for change in raw_changes
-                }
-                direct_imports = select_direct_import_paths(
-                    changed_contents={
-                        path: content
-                        for path, content in file_cache.items()
-                        if path in changed_path_set and content is not None
-                    },
-                    repository_paths=repository_paths,
-                    profile=project_profile,
-                    file_loader=load_file,
-                )
-                expanded_related = _merge_related_selections(
-                    prepared_history.dependency_selections,
-                    select_related_paths(
-                        changed_paths=changed_path_set,
-                        repository_paths=repository_paths,
-                        profile=project_profile,
-                        max_files=32,
-                    ),
-                    direct_imports,
-                )
-                if expanded_related != related_paths:
-                    related_paths = expanded_related
-                    context = make_context(related_paths)
 
             context.historical_findings = [
                 item.to_prompt() for item in prepared_history.revalidation

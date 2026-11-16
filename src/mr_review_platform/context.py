@@ -388,6 +388,34 @@ def _is_ignored(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
 
 
+def changed_path_skip_reason(
+    raw: dict[str, Any],
+    *,
+    supported_extensions: list[str],
+    ignore_paths: list[str],
+) -> str | None:
+    """Return the non-content skip reason for a changed path, or None.
+
+    Deleted files remain reviewable (their diff is still analyzed) and are not
+    part of this predicate; callers that need file content must skip them.
+    """
+
+    old_path = str(raw.get("old_path") or "")
+    new_path = str(raw.get("new_path") or old_path)
+    path = new_path or old_path
+    if _is_ignored(path, ignore_paths):
+        return "ignored_path"
+    if not _is_supported(path, supported_extensions):
+        return "unsupported"
+    if raw.get("binary"):
+        return "binary"
+    if raw.get("too_large"):
+        return "too_large"
+    if raw.get("collapsed") and not raw.get("diff"):
+        return "collapsed"
+    return None
+
+
 def _extract_snippet(content: str, lines: set[int], radius: int = 20, limit: int = 8000) -> str:
     if not content:
         return ""
@@ -399,6 +427,62 @@ def _extract_snippet(content: str, lines: set[int], radius: int = 20, limit: int
         selected.update(range(max(1, line_no - radius), min(len(source), line_no + radius) + 1))
     chunks = [f"{line_no}: {source[line_no - 1]}" for line_no in sorted(selected)]
     return "\n".join(chunks)[:limit]
+
+
+def preload_changed_contents(
+    raw_changes: list[dict[str, Any]],
+    *,
+    supported_extensions: list[str],
+    ignore_paths: list[str],
+    file_loader: Callable[[str], str | None],
+    max_files: int = 32,
+) -> dict[str, str]:
+    """Fetch changed-file bodies for diff-driven reference discovery.
+
+    Deleted files have no head content; skipped/ignored/unsupported files are
+    excluded by the same predicate used by the Context Builder. The result is
+    memoized by the caller's loader, so the later Context build does not re-fetch
+    these files.
+    """
+
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for raw in raw_changes:
+        old_path = str(raw.get("old_path") or "")
+        new_path = str(raw.get("new_path") or old_path)
+        path = new_path or old_path
+        if not path or path in seen:
+            continue
+        kind = _change_type(raw)
+        if kind == "deleted":
+            continue
+        if (
+            changed_path_skip_reason(
+                raw,
+                supported_extensions=supported_extensions,
+                ignore_paths=ignore_paths,
+            )
+            is not None
+        ):
+            continue
+        seen.add(path)
+        score = (
+            _risk_score(path, kind)
+            + (100 if raw.get("head_delta") else 0)
+            + (80 if raw.get("history_revalidation") else 0)
+        )
+        candidates.append((score, path))
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    contents: dict[str, str] = {}
+    for _, path in candidates[:max_files]:
+        try:
+            content = file_loader(path)
+        except Exception:
+            content = None
+        if content is not None:
+            contents[path] = content
+    return contents
 
 
 def build_context_pack(
@@ -461,64 +545,33 @@ def build_context_pack(
             )
         )
 
+    skip_selection = {
+        "ignored_path": ("skipped", "matched_ignore_path"),
+        "unsupported": ("skipped", "extension_not_supported"),
+        "binary": ("skipped", "gitlab_marked_binary"),
+        "too_large": ("skipped", "gitlab_marked_too_large"),
+        "collapsed": ("failed", "gitlab_collapsed_diff_unavailable"),
+    }
     for raw in raw_changes:
         old_path = str(raw.get("old_path") or "")
         new_path = str(raw.get("new_path") or old_path)
         path = new_path or old_path
         kind = _change_type(raw)
-        if _is_ignored(path, ignore_paths):
-            skipped.append({"path": path, "reason": "ignored_path"})
+        skip_reason = changed_path_skip_reason(
+            raw,
+            supported_extensions=supported_extensions,
+            ignore_paths=ignore_paths,
+        )
+        if skip_reason is not None:
+            status, selection_reason = skip_selection[skip_reason]
+            skipped.append({"path": path, "reason": skip_reason})
             record_unreviewed(
                 path=path,
                 old_path=old_path,
-                status="skipped",
+                status=status,
                 source="diff",
-                reason="ignored_path",
-                selection_reason="matched_ignore_path",
-            )
-            continue
-        if not _is_supported(path, supported_extensions):
-            skipped.append({"path": path, "reason": "unsupported"})
-            record_unreviewed(
-                path=path,
-                old_path=old_path,
-                status="skipped",
-                source="diff",
-                reason="unsupported",
-                selection_reason="extension_not_supported",
-            )
-            continue
-        if raw.get("binary"):
-            skipped.append({"path": path, "reason": "binary"})
-            record_unreviewed(
-                path=path,
-                old_path=old_path,
-                status="skipped",
-                source="diff",
-                reason="binary",
-                selection_reason="gitlab_marked_binary",
-            )
-            continue
-        if raw.get("too_large"):
-            skipped.append({"path": path, "reason": "too_large"})
-            record_unreviewed(
-                path=path,
-                old_path=old_path,
-                status="skipped",
-                source="diff",
-                reason="too_large",
-                selection_reason="gitlab_marked_too_large",
-            )
-            continue
-        if raw.get("collapsed") and not raw.get("diff"):
-            skipped.append({"path": path, "reason": "collapsed"})
-            record_unreviewed(
-                path=path,
-                old_path=old_path,
-                status="failed",
-                source="diff",
-                reason="collapsed",
-                selection_reason="gitlab_collapsed_diff_unavailable",
+                reason=skip_reason,
+                selection_reason=selection_reason,
             )
             continue
         diff = str(raw.get("diff") or "")
